@@ -56,30 +56,6 @@ class ColorSelector(QDialog):
         return [self.list_widget.item(i).text()
                 for i in range(self.list_widget.count())]
 
-class FocusDialog(QDialog):
-    """Dialog for showing a focused/zoomed region of the image."""
-
-    def __init__(self, focused_img, label="", parent=None):
-        super().__init__(parent)
-        self.setWindowTitle(f"Focused View: {label}")
-        self.setModal(True)
-        self.resize(600, 600)  # Fixed size for the dialog
-
-        layout = QVBoxLayout(self)
-        self.focus_canvas = MplCanvas(600, 600, 100)  # Smaller DPI for dialog
-        layout.addWidget(self.focus_canvas)
-
-        close_button = QPushButton("Close")
-        close_button.clicked.connect(self.accept)
-        layout.addWidget(close_button)
-
-        # Show the focused image at 200% zoom
-        scale_factor = 2.0
-        h, w = focused_img.shape[:2]
-        zoomed_img = cv2.resize(focused_img, (int(w * scale_factor), int(h * scale_factor)),
-                                interpolation=cv2.INTER_CUBIC)  # Smooth upscale
-        self.focus_canvas.show_frame(zoomed_img, label)
-
 class MplCanvas(FigureCanvas):
     """Matplotlib canvas for displaying single TIFF frames."""
 
@@ -95,6 +71,14 @@ class MplCanvas(FigureCanvas):
         # Inset axes for overview (x, y, width, height) in figure coords [0–1]
         self.over_ax = self.fig.add_axes([0.92, 0.5, 0.08, 0.5])  
         self.over_ax.axis("off")
+
+        # Inset axes for magnifier
+        self.mag_ax = self.fig.add_axes([0.8, 0.05, 0.2, 0.2])
+        self.mag_ax.axis("off")
+        self.mag_ax.set_visible(False)
+        self.mag_img = None
+        self.mag_patch = None
+
         super().__init__(self.fig)
         
         self.mpl_connect("draw_event", self.on_draw_event)
@@ -114,10 +98,20 @@ class MplCanvas(FigureCanvas):
         # Connect key press handler
         self.mpl_connect("key_press_event", self.on_key_press)
 
-        # Connect mouse click for focus dialog
-        self.mpl_connect("button_press_event", self.on_mouse_click)
-
         self.img_shape = None  # will store current image size
+
+        # Connect mouse motion for magnifier and overview
+        self.mpl_connect("motion_notify_event", self.on_mouse_motion)
+        self.mpl_connect("button_release_event", self.update_overview_rect)
+
+        # Connect resize event for proper figure scaling
+        self.mpl_connect("resize_event", self.on_resize)
+
+    def on_resize(self, event):
+        w, h = self.get_width_height()
+        dpi = self.fig.dpi
+        self.fig.set_size_inches(w / dpi, h / dpi)
+        self.draw()
 
     def show_frame(self, img, label=""):
         """Display a single frame with assigned colormap and optional overview inset."""
@@ -196,10 +190,6 @@ class MplCanvas(FigureCanvas):
         self.draw()
         self.img_shape = img.shape
 
-        # Connect for overview updates during pan/zoom
-        self.mpl_connect("motion_notify_event", self.update_overview_rect)
-        self.mpl_connect("button_release_event", self.update_overview_rect)
-
     def on_draw_event(self, event):
         """Log frame rendering time."""
         label = self.ax.get_title()
@@ -219,30 +209,62 @@ class MplCanvas(FigureCanvas):
         elif event.key in zoom_out_keys:
             self.zoom_out()
 
-    def on_mouse_click(self, event):
-        """Open focused view on mouse click."""
-        if event.inaxes != self.ax or event.button != 1:  # Left-click only on main axes
+    def on_mouse_motion(self, event):
+        if event.inaxes != self.ax:
+            self.mag_ax.set_visible(False)
+            if self.mag_patch:
+                self.mag_patch.set_visible(False)
+            self.draw_idle()
+            self.update_overview_rect(event)
             return
 
-        # Get click coordinates in image space
         x, y = event.xdata, event.ydata
         if x is None or y is None:
             return
 
-        # Extract square region around click (20% of image size)
-        img_array = self.main_img.get_array()
-        h, w = img_array.shape[:2]
-        region_size = int(min(h, w) * 0.2)  # 20% crop size
-        x_start = max(0, int(x - region_size / 2))
-        y_start = max(0, int(y - region_size / 2))
-        x_end = min(w, x_start + region_size)
-        y_end = min(h, y_start + region_size)
+        img = self.main_img.get_array()
+        h, w = img.shape[:2]
 
-        focused_img = img_array[y_start:y_end, x_start:x_end]
+        # Define region size
+        region_half = 50  # 100x100 target crop
+        half_x = min(region_half, x, w - 1 - x)
+        half_y = min(region_half, y, h - 1 - y)
 
-        # Open dialog
-        dialog = FocusDialog(focused_img, self.ax.get_title(), parent=self)
-        dialog.exec_()
+        left = int(x - half_x)
+        right = left + int(2 * half_x)
+        top = int(y - half_y)
+        bottom = top + int(2 * half_y)
+
+        crop = img[top:bottom, left:right]
+
+        # Upsample to fixed size for consistent display
+        zoomed_size = 400
+        zoomed = cv2.resize(crop, (zoomed_size, zoomed_size), interpolation=cv2.INTER_CUBIC)
+
+        cmap = self.main_img.get_cmap()
+
+        if self.mag_img is None:
+            self.mag_img = self.mag_ax.imshow(zoomed, cmap=cmap, interpolation='nearest')
+            self.mag_ax.axis('off')
+
+        else:
+            self.mag_img.set_data(zoomed)
+
+        self.mag_ax.set_visible(True)
+
+        # Update patch
+        if not self.mag_patch:
+            self.mag_patch = patches.Rectangle(
+                (left, top), right - left, bottom - top,
+                facecolor='none', edgecolor='yellow', linewidth=1
+            )
+            self.ax.add_patch(self.mag_patch)
+        else:
+            self.mag_patch.set_bounds(left, top, right - left, bottom - top)
+            self.mag_patch.set_visible(True)
+
+        self.draw_idle()
+        self.update_overview_rect(event)
 
     def zoom_out(self):
         # Reset to full image
