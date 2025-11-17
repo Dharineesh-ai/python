@@ -22,17 +22,16 @@ from PyQt5.QtCore import Qt
 
 import matplotlib.patches as patches
 
-# Ensure non-interactive backend for faster rendering
+# Ensure non-interactive backend for faster rendering when needed
 matplotlib.use("Agg")
+
 
 class ColorSelector(QDialog):
     """Dialog for assigning colors to TIFF frames."""
-
     def __init__(self, num_frames, default_colors=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Assign Colors to TIFF Frames")
         self.setModal(True)
-        print(f"num_frames {num_frames}")
 
         if not default_colors:
             default_colors = ["Red", "Green", "Blue", "Alpha"]
@@ -56,161 +55,194 @@ class ColorSelector(QDialog):
         return [self.list_widget.item(i).text()
                 for i in range(self.list_widget.count())]
 
-class MplCanvas(FigureCanvas):
-    """Matplotlib canvas for displaying single TIFF frames."""
 
+class MplCanvas(FigureCanvas):
+    """Matplotlib canvas for displaying single TIFF frames with magnifier and overview."""
     def __init__(self, width, height, dpi):
-        self.width_ = width
-        self.height_ = height
+        # Figure sized in inches
         fig_width_in = width / dpi
         fig_height_in = height / dpi
-
         self.fig = Figure(figsize=(fig_width_in, fig_height_in), dpi=dpi)
-        self.ax = self.fig.add_axes([0, 0, 1, 1])  # full-figure axes
-
-        # Inset axes for overview (x, y, width, height) in figure coords [0–1]
-        self.over_ax = self.fig.add_axes([0.92, 0.5, 0.08, 0.5])  
+        # main axis covering full figure
+        self.ax = self.fig.add_axes([0, 0, 1, 1])
+        # overview inset (right side)
+        self.over_ax = self.fig.add_axes([0.92, 0.5, 0.08, 0.5])
         self.over_ax.axis("off")
-
-        # Inset axes for magnifier
-        self.mag_ax = self.fig.add_axes([0.8, 0.05, 0.2, 0.2])
+        # magnifier inset (bottom-right)
+        self.mag_ax = self.fig.add_axes([0.75, 0.05, 0.2, 0.2])
         self.mag_ax.axis("off")
         self.mag_ax.set_visible(False)
-        self.mag_img = None
-        self.mag_patch = None
 
         super().__init__(self.fig)
-        
+
+        # connections
         self.mpl_connect("draw_event", self.on_draw_event)
+        self.mpl_connect("motion_notify_event", self.on_mouse_motion)
+        self.mpl_connect("button_release_event", self.update_overview_rect)
+        self.mpl_connect("key_press_event", self.on_key_press)
+        self.mpl_connect("resize_event", self.on_resize)
+
         self.draw_start = time.time()
 
-        # Custom colormaps
-        self.red_cmap = LinearSegmentedColormap.from_list(
-            "red_map", [(0, "black"), (1, "red")]
-        )
-        self.green_cmap = LinearSegmentedColormap.from_list(
-            "green_map", [(0, "black"), (1, "green")]
-        )
-        # 👇 allow key press events
+        # custom colormaps
+        self.red_cmap = LinearSegmentedColormap.from_list("red_map", [(0, "black"), (1, "red")])
+        self.green_cmap = LinearSegmentedColormap.from_list("green_map", [(0, "black"), (1, "green")])
+
+        # for reuse
+        self.main_img = None
+        self.overview_img = None
+        self.overview_rect = None
+        self.mag_img = None
+        self.mag_patch = None  # rectangle on main image
+        self.img_shape = None
+        self.current_cmap = "gray"
+
+        # focus to receive keyboard events
         self.setFocusPolicy(Qt.StrongFocus)
         self.setFocus()
 
-        # Connect key press handler
-        self.mpl_connect("key_press_event", self.on_key_press)
-
-        self.img_shape = None  # will store current image size
-
-        # Connect mouse motion for magnifier and overview
-        self.mpl_connect("motion_notify_event", self.on_mouse_motion)
-        self.mpl_connect("button_release_event", self.update_overview_rect)
-
-        # Connect resize event for proper figure scaling
-        self.mpl_connect("resize_event", self.on_resize)
-
     def on_resize(self, event):
-        w, h = self.get_width_height()
-        dpi = self.fig.dpi
-        self.fig.set_size_inches(w / dpi, h / dpi)
-        self.draw()
+        # keep figure size consistent with canvas
+        try:
+            w, h = self.get_width_height()
+            dpi = self.fig.dpi
+            self.fig.set_size_inches(w / dpi, h / dpi)
+        except Exception:
+            pass
+        # don't force draw here to avoid recursion
 
     def show_frame(self, img, label=""):
-        """Display a single frame with assigned colormap and optional overview inset."""
-    
-        # --- Choose colormap ---
+        """Display a single frame with assigned colormap and optionally update overview inset."""
+        # choose cmap
         if label == "Red":
             cmap = self.red_cmap
+            self.current_cmap = cmap
         elif label == "Green":
             cmap = self.green_cmap
+            self.current_cmap = cmap
         else:
             cmap = "gray"
-    
-        # --- Main image ---
-        if hasattr(self, "main_img"):
-            # Reuse existing image for speed
+            self.current_cmap = cmap
+
+        # main image
+        if self.main_img is None:
+            self.ax.clear()
+            self.main_img = self.ax.imshow(img, cmap=cmap, interpolation="nearest", animated=True)
+            self.ax.axis("off")
+        else:
             self.main_img.set_data(img)
             self.main_img.set_cmap(cmap)
-        else:
-            self.ax.clear()
-            self.main_img = self.ax.imshow(
-                img, cmap=cmap,
-                interpolation="nearest", resample=False, animated=True
-            )
-            self.ax.axis("off")
-    
+
         self.ax.set_title(label)
-    
-        # --- Overview inset (only for portrait images) ---
-        if img.shape[1] > img.shape[0]:  # portrait case
-            #over_img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
-            over_img = img
-            h, w = over_img.shape[:2]
-            ratio = (self.height_ / 2) / h
-            over_img_resized = cv2.resize(
-                over_img, (int(ratio * w), int(self.height_ / 2)),
-                interpolation=cv2.INTER_AREA
-            )
-    
-            new_width = over_img_resized.shape[1] / self.width_
+        self.img_shape = img.shape[:2]  # (h, w)
+
+        # Overview inset: show scaled-down full image
+        h, w = img.shape[:2]
+        # portrait if height > width
+        if h > w:
+            over_img = img.copy()
+            # compute a resized preview to fit half canvas height
+            ratio = (self.fig.bbox.height / 2) / h
+            new_w = max(1, int(ratio * w))
+            new_h = max(1, int(ratio * h))
+            over_img_resized = cv2.resize(over_img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+            new_width = over_img_resized.shape[1] / self.fig.bbox.width
+            # adjust over_ax position to occupy right area
             self.over_ax.set_position([1 - new_width, 0.5, new_width, 0.5])
             self.over_ax.set_visible(True)
-    
-            if hasattr(self, "overview_img"):
-                self.overview_img.set_data(over_img_resized)
-            else:
+
+            if self.overview_img is None:
                 self.over_ax.clear()
-                self.overview_img = self.over_ax.imshow(
-                    over_img_resized, cmap="gray",
-                    interpolation="nearest", resample=False
-                )
+                self.overview_img = self.over_ax.imshow(over_img_resized, cmap="gray", interpolation="nearest")
                 self.over_ax.axis("off")
-    
-            if not hasattr(self, "overview_rect"):
-                self.overview_rect = matplotlib.patches.Rectangle(
-                    (0, 0),
-                    over_img_resized.shape[1],
-                    over_img_resized.shape[0],
-                    edgecolor="red", facecolor="none", linewidth=1
-                )
-                self.over_ax.add_patch(self.overview_rect)
             else:
-                self.overview_rect.set_bounds(
-                    0, 0,
-                    over_img_resized.shape[1],
-                    over_img_resized.shape[0]
-                )
+                self.overview_img.set_data(over_img_resized)
+
+            # create or update overview rectangle
+            if self.overview_rect is None:
+                self.overview_rect = patches.Rectangle((0, 0),
+                                                      over_img_resized.shape[1],
+                                                      over_img_resized.shape[0],
+                                                      edgecolor="red",
+                                                      facecolor="none",
+                                                      linewidth=1)
+                self.over_ax.add_patch(self.overview_rect)
         else:
-            # Hide overview axis if not portrait
+            # hide overview if not portrait
             self.over_ax.clear()
             self.over_ax.set_visible(False)
             self.overview_img = None
             self.overview_rect = None
-    
-        # --- Final draw ---
+
+        # Reset view to show full image
+        self.ax.set_xlim(0, self.img_shape[1])
+        self.ax.set_ylim(self.img_shape[0], 0)
+
         self.draw_start = time.time()
-        self.draw()
-        self.img_shape = img.shape
+        self.draw_idle()
 
     def on_draw_event(self, event):
-        """Log frame rendering time."""
         label = self.ax.get_title()
         timestamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
         draw_time_ms = (time.time() - self.draw_start) * 1000
-        print(f"[{label}] draw() completed at {timestamp} "
-              f"(draw time: {draw_time_ms:.2f} ms)")
+        print(f"[{label}] draw() completed at {timestamp} (draw time: {draw_time_ms:.2f} ms)")
 
     def on_key_press(self, event):
-        print("DEBUG key:", event.key)  # keep for testing at first
-    
-        zoom_in_keys = ["ctrl++", "ctrl+]", "ctrl+equal", "ctrl+add", "ctrl+plus"]
-        zoom_out_keys = ["ctrl+-", "ctrl+subtract", "ctrl+minus"]
-    
-        if event.key in zoom_in_keys:
-            self.zoom_in()
-        elif event.key in zoom_out_keys:
-            self.zoom_out()
+        # allow simple zoom keys: ctrl+'=' or '+' to zoom in, ctrl+'-' or '-' to zoom out
+        key = event.key
+        # print("DEBUG key:", key)
+        if key is None:
+            return
+        # common representations include 'ctrl++', 'ctrl+-', or just '+', '-'
+        if 'ctrl' in str(key):
+            if '=' in key or '+' in key:
+                self.zoom_in()
+            elif '-' in key:
+                self.zoom_out()
+        else:
+            if key in ('+', 'equal'):
+                self.zoom_in()
+            elif key in ('-', 'minus'):
+                self.zoom_out()
+
+    def zoom_in(self, factor=0.7):
+        """Zoom toward center by factor (<1 zooms in)."""
+        if self.img_shape is None:
+            return
+        x0, x1 = self.ax.get_xlim()
+        y0, y1 = self.ax.get_ylim()
+        cx = (x0 + x1) / 2.0
+        cy = (y0 + y1) / 2.0
+        width = (x1 - x0) * factor
+        height = (y1 - y0) * factor
+        self.ax.set_xlim(cx - width / 2.0, cx + width / 2.0)
+        self.ax.set_ylim(cy + height / 2.0, cy - height / 2.0)  # inverted y-axis
+        self.update_overview_rect()
+        self.draw_idle()
+
+    def zoom_out(self, factor=1.4):
+        """Zoom out by factor (>1 zooms out)."""
+        if self.img_shape is None:
+            return
+        x0, x1 = self.ax.get_xlim()
+        y0, y1 = self.ax.get_ylim()
+        cx = (x0 + x1) / 2.0
+        cy = (y0 + y1) / 2.0
+        width = (x1 - x0) * factor
+        height = (y1 - y0) * factor
+        # clamp to image bounds
+        width = min(width, self.img_shape[1])
+        height = min(height, self.img_shape[0])
+        self.ax.set_xlim(max(0, cx - width / 2.0), min(self.img_shape[1], cx + width / 2.0))
+        self.ax.set_ylim(min(self.img_shape[0], cy + height / 2.0), max(0, cy - height / 2.0))
+        self.update_overview_rect()
+        self.draw_idle()
 
     def on_mouse_motion(self, event):
+        """Show magnifier when cursor is on main axis; hide otherwise."""
         if event.inaxes != self.ax:
+            # hide magnifier and patch
             self.mag_ax.set_visible(False)
             if self.mag_patch:
                 self.mag_patch.set_visible(False)
@@ -219,114 +251,105 @@ class MplCanvas(FigureCanvas):
             return
 
         x, y = event.xdata, event.ydata
-        if x is None or y is None:
+        if x is None or y is None or self.main_img is None:
             return
 
         img = self.main_img.get_array()
         h, w = img.shape[:2]
 
-        # Define region size
-        region_half = 50  # 100x100 target crop
-        half_x = min(region_half, x, w - 1 - x)
-        half_y = min(region_half, y, h - 1 - y)
+        # set target region half-size taking into account current zoom
+        region_half = 50  # desired half-size on image coordinates
+        # ensure region within bounds
+        xi = int(round(x))
+        yi = int(round(y))
+        left = max(0, xi - region_half)
+        right = min(w, xi + region_half)
+        top = max(0, yi - region_half)
+        bottom = min(h, yi + region_half)
 
-        left = int(x - half_x)
-        right = left + int(2 * half_x)
-        top = int(y - half_y)
-        bottom = top + int(2 * half_y)
+        # If region is degenerate (near edge), pad by expanding the other side
+        if (right - left) < 10 or (bottom - top) < 10:
+            left = max(0, xi - region_half)
+            right = min(w, xi + region_half)
+            top = max(0, yi - region_half)
+            bottom = min(h, yi + region_half)
 
+        # crop and upscale
         crop = img[top:bottom, left:right]
+        if crop.size == 0:
+            return
 
-        # Upsample to fixed size for consistent display
         zoomed_size = 400
-        zoomed = cv2.resize(crop, (zoomed_size, zoomed_size), interpolation=cv2.INTER_CUBIC)
+        try:
+            zoomed = cv2.resize(crop, (zoomed_size, zoomed_size), interpolation=cv2.INTER_CUBIC)
+        except Exception:
+            # fallback if crop too small
+            zoomed = cv2.resize(crop, (zoomed_size, zoomed_size), interpolation=cv2.INTER_NEAREST)
 
-        cmap = self.main_img.get_cmap()
-
+        # update magnifier image
         if self.mag_img is None:
-            self.mag_img = self.mag_ax.imshow(zoomed, cmap=cmap, interpolation='nearest')
+            self.mag_img = self.mag_ax.imshow(zoomed, cmap=self.current_cmap, interpolation='nearest')
             self.mag_ax.axis('off')
-
         else:
             self.mag_img.set_data(zoomed)
+            self.mag_img.set_cmap(self.current_cmap)
 
         self.mag_ax.set_visible(True)
 
-        # Update patch
-        if not self.mag_patch:
-            self.mag_patch = patches.Rectangle(
-                (left, top), right - left, bottom - top,
-                facecolor='none', edgecolor='yellow', linewidth=1
-            )
+        # update yellow rectangle on main image
+        if self.mag_patch is None:
+            self.mag_patch = patches.Rectangle((left, top), right - left, bottom - top,
+                                               facecolor='none', edgecolor='yellow', linewidth=1)
             self.ax.add_patch(self.mag_patch)
         else:
             self.mag_patch.set_bounds(left, top, right - left, bottom - top)
             self.mag_patch.set_visible(True)
 
-        self.draw_idle()
+        # update overview rectangle
         self.update_overview_rect(event)
+        self.draw_idle()
 
-    def zoom_out(self):
-        # Reset to full image
-        if self.img_shape is None:
-            return
-    
-        h, w = self.img_shape[:2]
-        print(f" ~~~~~tiff_h, tiff_w {h}, {w}")
-        
-        self.setFixedSize(QSize(self.width_, self.height_))
-        self.draw_idle()
-        self.update_overview_rect()
-    
-    def zoom_in(self):
-        print("zoom_in")
-        if self.img_shape is None:
-            return
-    
-        h, w = self.img_shape[:2]
-        #print(f" ~~~~~tiff_h, tiff_w {h}, {w}")
-        bbox = self.ax.get_window_extent().transformed(self.fig.dpi_scale_trans.inverted())
-        screen_w = bbox.width * self.fig.dpi
-        screen_h = bbox.height * self.fig.dpi
-        #print(f" ~~~~~fig_h, fig_w {screen_h}, {screen_w}")
-    
-        # Scale so smaller side fits canvas
-        scale = min(screen_w / w, screen_h / h)
-    
-        view_w = screen_w / scale
-        view_h = screen_h / scale
-        
-        self.setFixedSize(QSize(int(view_w), int(view_h)))
-        self.draw_idle()
-        self.update_overview_rect()
-        
-    def update_overview_rect(self, *args):
-        print("update_overview_rect")
-        """Update rectangle to match visible portion of main image."""
-        if not (self.overview_img and self.overview_rect):
+    def update_overview_rect(self, event=None):
+        """Update overview rectangle to match visible portion of main image."""
+        if not (self.overview_img and self.overview_rect and self.main_img):
             return
 
-        # Main image visible range
-        x0, x1 = self.ax.get_xlim()
-        y0, y1 = self.ax.get_ylim()
+        try:
+            x0, x1 = self.ax.get_xlim()
+            y0, y1 = self.ax.get_ylim()
+        except Exception:
+            return
 
-        # Normalize to overview image coordinates
-        ov_xmax, ov_ymax = self.overview_img.get_array().shape[1], self.overview_img.get_array().shape[0]
-        rect_x = max(0, x0 / self.main_img.get_array().shape[1] * ov_xmax)
-        rect_y = max(0, y0 / self.main_img.get_array().shape[0] * ov_ymax)
-        rect_w = (x1 - x0) / self.main_img.get_array().shape[1] * ov_xmax
-        rect_h = (y1 - y0) / self.main_img.get_array().shape[0] * ov_ymax
+        # main image dims
+        main_h, main_w = self.main_img.get_array().shape[:2]
+        ov_arr = self.overview_img.get_array()
+        ov_h, ov_w = ov_arr.shape[:2]
 
-        self.overview_rect.set_bounds(rect_x, rect_y, rect_w, rect_h)
-        self.draw_idle()
+        # compute normalized rectangle in overview coords
+        rect_x = max(0, x0 / main_w * ov_w)
+        rect_y = max(0, y1 / main_h * ov_h)  # careful: y-axis inverted
+        rect_w = (x1 - x0) / main_w * ov_w
+        rect_h = (y0 - y1) / main_h * ov_h
+
+        # bounds checks
+        rect_x = max(0, min(ov_w, rect_x))
+        rect_y = max(0, min(ov_h, rect_y))
+        rect_w = max(1, min(ov_w - rect_x, rect_w))
+        rect_h = max(1, min(ov_h - rect_y, rect_h))
+
+        try:
+            self.overview_rect.set_bounds(rect_x, rect_y, rect_w, rect_h)
+        except Exception:
+            pass
+
+        # no draw here; caller will draw_idle()
 
 class MainWindow(QMainWindow):
-    """Main TIFF viewer window."""
-
+    """Main TIFF viewer window with integrated magnifier/overview."""
     def __init__(self, tiff_path, width, height, dpi):
         super().__init__()
         self.setWindowTitle("TIFF Frame Viewer")
-        
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
@@ -336,20 +359,19 @@ class MainWindow(QMainWindow):
 
         scroll_area = QScrollArea()
         self.canvas = MplCanvas(width, height, dpi)
-        
+        # show canvas inside scroll area
         scroll_area.setWidget(self.canvas)
         scroll_area.setWidgetResizable(True)
-        
+
         self.width = width
         self.height = height
-        print(f"Screen size is {width}, {height}")
         self.dpi = dpi
-    
-        # Layout with canvas + scroll bar
+
+        # layout
         layout = QVBoxLayout()
         layout.addWidget(scroll_area)
-    
-        # Create scroll bar FIRST
+
+        # horizontal scrollbar for frames
         self.scroll_bar = QScrollBar(Qt.Horizontal)
         self.scroll_bar.setStyleSheet("""
             QScrollBar:horizontal {
@@ -365,32 +387,31 @@ class MainWindow(QMainWindow):
         self.scroll_bar.setSingleStep(1)
         self.scroll_bar.valueChanged.connect(self.display_frame)
         layout.addWidget(self.scroll_bar)
-        
+
         layout.addWidget(self.progress_bar)
-    
-        # Add layout to central widget
+
         container = QWidget()
         container.setLayout(layout)
         self.setCentralWidget(container)
-    
-        # Determine preload mode
+
+        # preload decision
         self.preload = self.should_preload(tiff_path)
-    
-        # Now safe to load TIFF (scroll_bar is already defined)
+
+        # safe to load TIFF now
         self.load_tiff(tiff_path)
 
     def should_preload(self, path):
         """Decide preload vs lazy based on TIFF size and available RAM."""
         file_size = os.path.getsize(path)  # bytes
         available_ram = psutil.virtual_memory().available  # bytes
-    
+
         file_gb = file_size / (1024**3)
         ram_gb = available_ram / (1024**3)
-    
+
         print(f"TIFF size: {file_gb:.2f} GB, Available RAM: {ram_gb:.2f} GB")
-    
+
         ratio = file_size / available_ram
-    
+
         if ratio < 0.25:
             print("➡ Preload mode (safe: TIFF <25% of free RAM)")
             return True
@@ -401,14 +422,14 @@ class MainWindow(QMainWindow):
         else:
             print("➡ Lazy mode (TIFF too large for safe preload)")
             return False
-    
+
     def load_tiff(self, path):
         self.tiff_path = path
-    
+
         if self.preload:
             print("▶ Loading TIFF in background thread...")
             self.progress_bar.setVisible(True)
-    
+
             self.loader_thread = TiffLoaderThread(path)
             self.loader_thread.progress.connect(self.progress_bar.setValue)
             self.loader_thread.finished.connect(self.on_tiff_loaded)
@@ -418,11 +439,15 @@ class MainWindow(QMainWindow):
             self.frames_count = len(self.tif.pages)
             sample = self.tif.pages[0].asarray()
             self.buffer = np.empty_like(sample)
-    
+
+            # ask user colors
             dialog = ColorSelector(self.frames_count, parent=self)
             if dialog.exec_():
                 self.selected_colors = dialog.get_selected_colors()
-    
+            else:
+                # fallback default (all gray)
+                self.selected_colors = ["Gray"] * self.frames_count
+
             self.scroll_bar.setMaximum(max(0, self.frames_count - 1))
             self.scroll_bar.setValue(0)
 
@@ -432,7 +457,7 @@ class MainWindow(QMainWindow):
         if frames.ndim in (3, 4):
             return frames.shape[0]
         raise ValueError("Unsupported TIFF shape.")
-    
+
     def display_frame(self, index=None):
         """Render a single TIFF frame."""
         index = self.scroll_bar.value()
@@ -442,40 +467,44 @@ class MainWindow(QMainWindow):
             frame = self.frames[index]
         else:
             frame = self.tif.pages[index].asarray(out=self.buffer)
-        
-        
-        #Rotate + resize in one step (OpenCV faster than np.rot90)
-        # if frame.shape[0] > frame.shape[1]:  # height > width
-        #     frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
-            
+
         orig_h, orig_w = frame.shape[:2]
+        # scale to fit screen width
         scale_factor = self.width / orig_w
-        target_height = int(orig_h * scale_factor)
-        
-        frame = cv2.resize(frame, (self.width, target_height),
-                           interpolation=cv2.INTER_AREA)
+        target_height = max(1, int(orig_h * scale_factor))
+
+        frame = cv2.resize(frame, (self.width, target_height), interpolation=cv2.INTER_AREA)
 
         access_time = (time.time() - access_start) * 1000
         print(f"Frame {index} access time: {access_time:.2f} ms")
 
-        color = self.selected_colors[index]
+        # color label for this frame
+        try:
+            color = self.selected_colors[index]
+        except Exception:
+            color = "Gray"
+
+        # show in canvas
         self.canvas.show_frame(frame, color)
-        
+
     def on_tiff_loaded(self, frames, count):
         print("✅ TIFF loaded in background.")
         self.frames = frames
         self.frames_count = count
         self.progress_bar.setVisible(False)
-    
+
         dialog = ColorSelector(self.frames_count, parent=self)
         if dialog.exec_():
             self.selected_colors = dialog.get_selected_colors()
-    
+        else:
+            self.selected_colors = ["Gray"] * self.frames_count
+
         self.scroll_bar.setMaximum(max(0, self.frames_count - 1))
         self.scroll_bar.setValue(0)
         if self.frames_count == 1:
             self.display_frame(0)
-        
+
+
 class TiffLoaderThread(QThread):
     progress = pyqtSignal(int)
     finished = pyqtSignal(np.ndarray, int)  # Emits (frames, frame_count)
@@ -495,11 +524,10 @@ class TiffLoaderThread(QThread):
             stacked = np.stack(frames, axis=0)
             self.finished.emit(stacked, num_pages)
 
+
 if __name__ == "__main__":
-    #tiff_path = (r"C:\Users\Raja Chandramohan\Pictures\Jessica\Feedback 4\2024.09.04_Norden Vac Disco_3901-01_700.TIF")
-    
+    # Update path as required
     tiff_path = (r"D:\python-master\2024.08.01_cLift-Kontrolle_A0206-02_Rl50Gh35_1677.tif")
-    #tiff_path = (r"C:\Users\Raja Chandramohan\Pictures\michael H\Test-TIF.tif")
 
     app = QApplication(sys.argv)
     screen = app.primaryScreen()
