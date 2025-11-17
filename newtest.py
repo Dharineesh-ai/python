@@ -1,7 +1,6 @@
 import sys
 import time
 from datetime import datetime
-import os
 import psutil
 
 import numpy as np
@@ -21,6 +20,14 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt
 
 import matplotlib.patches as patches
+
+import os
+
+# Skip GUI + TIFF loading when running in GitHub Actions
+if os.getenv("CI") == "true":
+    print("Running in CI mode — skipping TIFF loading and GUI.")
+    exit(0)
+
 
 # Ensure non-interactive backend for faster rendering when needed
 matplotlib.use("Agg")
