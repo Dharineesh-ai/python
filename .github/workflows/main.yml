@@ -7,19 +7,31 @@ on:
     branches: [ master ]
 
 jobs:
-  build:
+  run-python-file:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout code
+    - name: Checkout repository
       uses: actions/checkout@v3
 
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
-        python-version: '3.8'
-    - name: Install dependencies
-      run: pip install psutil
+        python-version: "3.8"
 
-    - name: Run script
-      run: python newtest.py
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libgl1 libx11-6  # Needed for OpenCV GUI compatibility
+        pip install numpy
+        pip install opencv-python-headless
+        pip install matplotlib
+        pip install tifffile
+        pip install psutil
+        pip install PyQt5==5.15.10
+
+    - name: Run newtest.py in headless mode
+      env:
+        QT_QPA_PLATFORM: offscreen   # Prevents GUI crash
+      run: |
+        python newtest.py
