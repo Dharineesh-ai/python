@@ -2,36 +2,38 @@
 import sys
 import time
 from datetime import datetime
+import os
 import psutil
 
 import numpy as np
 import cv2
 import tifffile
+
+# If running in CI/headless, use Agg; otherwise use Qt5Agg so FigureCanvasQTAgg works.
 import matplotlib
+if os.getenv("CI") == "true":
+    print("Running in CI mode — using non-interactive Agg backend.")
+    matplotlib.use("Agg")
+else:
+    # Ensure we use the Qt5Agg backend for FigureCanvasQTAgg
+    matplotlib.use("Qt5Agg")
+
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from matplotlib.colors import LinearSegmentedColormap
-from PyQt5.QtWidgets import QProgressBar, QSizePolicy
-from PyQt5.QtCore import QThread, pyqtSignal, QSize
+import matplotlib.patches as patches
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QScrollArea, QVBoxLayout, QWidget, QScrollBar,
-    QListWidgetItem, QPushButton, QLabel, QListWidget, QDialog
+    QListWidgetItem, QPushButton, QLabel, QListWidget, QDialog, QProgressBar, QSizePolicy
 )
-from PyQt5.QtCore import Qt, QPoint
+from PyQt5.QtCore import Qt, QPoint, QThread, pyqtSignal, QSize
 from PyQt5.QtGui import QImage, QPixmap
 
-import matplotlib.patches as patches
-
-import os
-
 # Skip GUI + TIFF loading when running in GitHub Actions
-if os.getenv("CI") == "true":
+if os.getenv("CI") == "true" and __name__ == "__main__":
     print("Running in CI mode — skipping TIFF loading and GUI.")
-    exit(0)
-
-# Ensure non-interactive backend for faster rendering when needed
-matplotlib.use("Agg")
+    sys.exit(0)
 
 
 def auto_fix_bgr_rgb(img_rgb):
@@ -45,17 +47,11 @@ def auto_fix_bgr_rgb(img_rgb):
     arr = np.ascontiguousarray(img_rgb)
     if arr.ndim != 3 or arr.shape[2] != 3:
         return arr
-    # convert to float for mean calculation safely
     a = arr.astype(np.float32)
-    # compute mean intensity per channel (assume channel order is currently R,G,B or B,G,R)
-    # We detect if the blue channel is significantly higher than red channel (common sign of BGR ordering)
-    # Note: the indexing below treats arr[:,:,0] as R-like by convention; if it's BGR, channel0 is B.
     r_mean = float(a[:, :, 0].mean())
     g_mean = float(a[:, :, 1].mean())
     b_mean = float(a[:, :, 2].mean())
-    # Heuristic: if blue channel is significantly larger than red channel, image likely BGR
     if b_mean > r_mean * 1.4 and (b_mean - r_mean) > 10:
-        # flip channel order BGR -> RGB
         fixed = arr[:, :, ::-1].copy()
         print("⚠ Auto-fix: detected probable BGR ordering — converted to RGB")
         return fixed
@@ -65,18 +61,14 @@ def auto_fix_bgr_rgb(img_rgb):
 def ensure_uint8_rgb(img):
     """
     Convert an image (any dtype, 1/3/4 channels) into a uint8 RGB image.
-    - Normalizes numeric range to 0..255 if dtype != uint8
-    - Converts single-channel -> RGB
-    - Converts 4-channel -> RGBA -> RGB
-    - If channels are identical (pure grayscale stored as 3-channel),
-      collapses to a proper RGB copy (still colorless but proper dtype).
-    Also applies auto_fix_bgr_rgb before returning 3-channel arrays.
+    Normalizes numeric range to 0..255 if dtype != uint8, converts single-channel -> RGB,
+    converts 4-channel -> RGB, and detects three-channel grayscale.
     """
     if img is None:
         return None
     img = np.ascontiguousarray(img)
 
-    # Convert to float for safe normalization if not uint8
+    # Normalize to uint8 if needed
     if img.dtype != np.uint8:
         f = img.astype(np.float32)
         mn = float(np.min(f))
@@ -89,7 +81,6 @@ def ensure_uint8_rgb(img):
     else:
         img8 = img
 
-    # Now handle channels
     if img8.ndim == 2:
         rgb = cv2.cvtColor(img8, cv2.COLOR_GRAY2RGB)
         return auto_fix_bgr_rgb(rgb)
@@ -99,28 +90,20 @@ def ensure_uint8_rgb(img):
             rgb = cv2.cvtColor(img8[:, :, 0], cv2.COLOR_GRAY2RGB)
             return auto_fix_bgr_rgb(rgb)
         if ch == 3:
-            # detect pure-grayscale stored in 3 channels (all channels identical)
             if np.array_equal(img8[:, :, 0], img8[:, :, 1]) and np.array_equal(img8[:, :, 1], img8[:, :, 2]):
                 rgb = cv2.cvtColor(img8[:, :, 0], cv2.COLOR_GRAY2RGB)
                 return auto_fix_bgr_rgb(rgb)
-            # else assume RGB or BGR; apply auto-fix heuristic
             return auto_fix_bgr_rgb(img8)
         if ch == 4:
             try:
-                # try BGRA -> RGB then check
                 candidate = cv2.cvtColor(img8, cv2.COLOR_BGRA2RGB)
-                # if candidate appears grayscale, try RGBA->RGB instead
                 if np.array_equal(candidate[:, :, 0], candidate[:, :, 1]) and np.array_equal(candidate[:, :, 1], candidate[:, :, 2]):
                     candidate2 = cv2.cvtColor(img8, cv2.COLOR_RGBA2RGB)
                     return auto_fix_bgr_rgb(candidate2)
                 return auto_fix_bgr_rgb(candidate)
             except Exception:
                 return auto_fix_bgr_rgb(img8[:, :, :3])
-    # else unexpected shape -> attempt to coerce to RGB by flattening
-    flat = img8
-    if flat.ndim == 1:
-        flat = flat.reshape((1, -1))
-        return ensure_uint8_rgb(flat)
+    # fallback
     return img8
 
 
@@ -157,7 +140,7 @@ class ColorSelector(QDialog):
 class DraggableOverlay(QLabel):
     """
     QLabel-based overlay that displays a zoomed QPixmap and supports dragging.
-    Parent should be the FigureCanvas (MplCanvas) so overlay coordinates align with canvas.
+    Parent should be the FigureCanvas so overlay coordinates align with canvas.
     """
     def __init__(self, parent=None, size=400):
         super().__init__(parent)
@@ -177,7 +160,7 @@ class DraggableOverlay(QLabel):
         self.resize(self.overlay_size, self.overlay_size)
         self._dragging = False
         self._drag_start_pos = QPoint(0, 0)
-        self.setVisible(False)  # start hidden until mouse over image
+        self.setVisible(False)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -210,16 +193,10 @@ class DraggableOverlay(QLabel):
             super().mouseReleaseEvent(event)
 
     def update_image_from_ndarray(self, arr):
-        """
-        Accepts a numpy array (grayscale or color) and updates the QLabel pixmap.
-        For 3-channel arrays, expects RGB order (this matches tifffile/Matplotlib).
-        """
         if arr is None or arr.size == 0:
             return
 
-        # Ensure it's uint8 RGB (or grayscale uint8)
         arr_rgb = ensure_uint8_rgb(arr)
-
         if arr_rgb is None:
             return
 
@@ -264,16 +241,16 @@ class MplCanvas(FigureCanvas):
 
         # state
         self.main_img = None
-        self.original_img = None  # uint8 RGB copy for overlay/overview
+        self.original_img = None
         self.overview_img = None
         self.overview_rect = None
         self.mag_patch = None
         self.img_shape = None
         self.current_cmap = "gray"
+        self.over_ax = None
 
         # overlay widget
         self.overlay = DraggableOverlay(parent=self, size=400)
-        # initial overlay position
         self.overlay.move(max(10, self.width() - self.overlay.overlay_size - 10),
                           max(10, self.height() - self.overlay.overlay_size - 10))
 
@@ -287,7 +264,6 @@ class MplCanvas(FigureCanvas):
             self.fig.set_size_inches(w / dpi, h / dpi)
         except Exception:
             pass
-        # make sure overlay remains visible inside bounds
         try:
             pw = self.width()
             ph = self.height()
@@ -300,11 +276,6 @@ class MplCanvas(FigureCanvas):
             pass
 
     def show_frame(self, display_img, label="", original_color=None):
-        """
-        display_img: 2D grayscale or 3-channel image to show on main axis (we show grayscale by default)
-        original_color: full-color image (any dtype) used for overlay and overview (converted to uint8 RGB)
-        """
-        # choose cmap
         if label == "Red":
             cmap = self.red_cmap
             self.current_cmap = cmap
@@ -315,7 +286,6 @@ class MplCanvas(FigureCanvas):
             cmap = "gray"
             self.current_cmap = cmap
 
-        # convert display_img -> uint8 grayscale (disp8)
         if display_img is None:
             return
         if display_img.dtype != np.uint8:
@@ -329,7 +299,6 @@ class MplCanvas(FigureCanvas):
         else:
             disp8 = display_img
 
-        # set or update main imshow
         if self.main_img is None:
             self.ax.clear()
             if disp8.ndim == 2:
@@ -345,31 +314,28 @@ class MplCanvas(FigureCanvas):
         self.ax.set_title(label)
         self.img_shape = disp8.shape[:2]
 
-        # store original color version (ensure uint8 RGB and auto-fix BGR if needed)
         if original_color is not None:
             try:
                 oc = ensure_uint8_rgb(original_color)
                 self.original_img = oc
             except Exception:
                 self.original_img = None
-
-        # update overview inset (portrait mode only as before)
-        h, w = disp8.shape[:2]
-        if h > w:
-            if self.original_img is not None:
-                over_img = self.original_img.copy()
-            else:
-                over_img = disp8.copy()
-
-            # resize preview
-            ratio = (self.fig.bbox.height / 2) / h
+            if hasattr(self, "over_ax") and self.over_ax:
+                self.over_ax.clear()
+                self.over_ax.set_visible(False)
+            self.overview_img = None
+            self.overview_rect = None
+        else:
+            over_img = disp8.copy()
+            ratio = (self.fig.bbox.height / 2) / max(1, h)
             new_w = max(1, int(ratio * w))
             new_h = max(1, int(ratio * h))
-            over_img_resized = cv2.resize(over_img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-
+            try:
+                over_img_resized = cv2.resize(over_img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            except Exception:
+                over_img_resized = over_img
             over_img_resized = ensure_uint8_rgb(over_img_resized)
-
-            new_width = over_img_resized.shape[1] / self.fig.bbox.width
+            new_width = over_img_resized.shape[1] / max(1.0, self.fig.bbox.width)
             if not hasattr(self, "over_ax") or self.over_ax is None:
                 self.over_ax = self.fig.add_axes([1 - new_width, 0.5, new_width, 0.5])
                 self.over_ax.axis("off")
@@ -378,7 +344,6 @@ class MplCanvas(FigureCanvas):
             else:
                 self.over_ax.set_position([1 - new_width, 0.5, new_width, 0.5])
                 self.over_ax.set_visible(True)
-
             if self.overview_img is None:
                 self.over_ax.clear()
                 if over_img_resized.ndim == 3:
@@ -388,7 +353,6 @@ class MplCanvas(FigureCanvas):
                 self.over_ax.axis("off")
             else:
                 self.overview_img.set_data(over_img_resized)
-
             if self.overview_rect is None:
                 self.overview_rect = patches.Rectangle((0, 0),
                                                       over_img_resized.shape[1],
@@ -397,14 +361,7 @@ class MplCanvas(FigureCanvas):
                                                       facecolor="none",
                                                       linewidth=1)
                 self.over_ax.add_patch(self.overview_rect)
-        else:
-            if hasattr(self, "over_ax") and self.over_ax:
-                self.over_ax.clear()
-                self.over_ax.set_visible(False)
-            self.overview_img = None
-            self.overview_rect = None
 
-        # reset view
         self.ax.set_xlim(0, self.img_shape[1])
         self.ax.set_ylim(self.img_shape[0], 0)
 
@@ -562,6 +519,32 @@ class MplCanvas(FigureCanvas):
             pass
 
 
+class TiffLoaderThread(QThread):
+    # Emit arbitrary Python object for frames
+    progress = pyqtSignal(int)
+    finished = pyqtSignal(object, int)  # (frames_array_or_list, frame_count)
+
+    def __init__(self, path):
+        super().__init__()
+        self.path = path
+
+    def run(self):
+        with tifffile.TiffFile(self.path) as tif:
+            num_pages = len(tif.pages)
+            frames = []
+            for i, page in enumerate(tif.pages):
+                # page.asarray is available in tifffile.TiffPage
+                frames.append(page.asarray())
+                percent = int(((i + 1) / num_pages) * 100)
+                self.progress.emit(percent)
+            try:
+                stacked = np.stack(frames, axis=0)
+            except Exception:
+                # fall back to list if stacking fails (heterogeneous shapes)
+                stacked = frames
+            self.finished.emit(stacked, num_pages)
+
+
 class MainWindow(QMainWindow):
     """Main TIFF viewer window with integrated magnifier/overview."""
     def __init__(self, tiff_path, width, height, dpi):
@@ -622,7 +605,7 @@ class MainWindow(QMainWindow):
 
         print(f"TIFF size: {file_gb:.2f} GB, Available RAM: {ram_gb:.2f} GB")
 
-        ratio = file_size / available_ram
+        ratio = file_size / max(1, available_ram)
 
         if ratio < 0.25:
             print("➡ Preload mode (safe: TIFF <25% of free RAM)")
@@ -663,22 +646,27 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def get_tiff_frame_count(tiff_path):
-        frames = tifffile.imread(tiff_path)
-        if frames.ndim in (3, 4):
-            return frames.shape[0]
-        raise ValueError("Unsupported TIFF shape.")
+        with tifffile.TiffFile(tiff_path) as tif:
+            return len(tif.pages)
 
-    def display_frame(self, index=None):
-        index = self.scroll_bar.value()
+    def display_frame(self, _=None):
+        index = int(self.scroll_bar.value())
         access_start = time.time()
 
         if self.preload:
-            frame = self.frames[index]
+            frame_container = getattr(self, "frames", None)
+            if frame_container is None:
+                return
+            # frames may be ndarray stacked or list
+            if isinstance(frame_container, np.ndarray):
+                frame = frame_container[index]
+            else:
+                frame = frame_container[index]
         else:
             frame = self.tif.pages[index].asarray(out=self.buffer)
 
         orig_h, orig_w = frame.shape[:2]
-        scale_factor = self.width / orig_w
+        scale_factor = self.width / max(1, orig_w)
         target_height = max(1, int(orig_h * scale_factor))
 
         frame_resized = cv2.resize(frame, (self.width, target_height), interpolation=cv2.INTER_AREA)
@@ -697,7 +685,6 @@ class MainWindow(QMainWindow):
             original_color = ensure_uint8_rgb(frame_resized)
         else:
             original_color = ensure_uint8_rgb(frame_resized)
-            # convert to grayscale for main display (from RGB)
             try:
                 display_img = cv2.cvtColor(original_color, cv2.COLOR_RGB2GRAY)
             except Exception:
@@ -723,30 +710,9 @@ class MainWindow(QMainWindow):
             self.display_frame(0)
 
 
-class TiffLoaderThread(QThread):
-    progress = pyqtSignal(int)
-    finished = pyqtSignal(np.ndarray, int)  # Emits (frames, frame_count)
-
-    def __init__(self, path):
-        super().__init__()
-        self.path = path
-
-    def run(self):
-        with tifffile.TiffFile(self.path) as tif:
-            num_pages = len(tif.pages)
-            frames = []
-            for i, page in enumerate(tif.pages):
-                frames.append(page.asarray())
-                percent = int(((i + 1) / num_pages) * 100)
-                self.progress.emit(percent)
-            stacked = np.stack(frames, axis=0)
-            self.finished.emit(stacked, num_pages)
-
-
 if __name__ == "__main__":
     # Update path as required
     tiff_path = (r"D:\python-master\2024.08.01_cLift-Kontrolle_A0206-02_Rl50Gh35_1677.tif")
-
     app = QApplication(sys.argv)
     screen = app.primaryScreen()
 
