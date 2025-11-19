@@ -213,38 +213,60 @@ class MplCanvas(FigureCanvas):
         except: pass
 
     def show_frame(self, display_img, label="", original_color=None):
-        if label == "Red":
-            cmap = self.red_cmap
-        elif label == "Green":
-            cmap = self.green_cmap
-        else:
-            cmap = "gray"
-        self.current_cmap = cmap
-
-        if display_img is None:
-            return
-
+        """
+        FINAL WORKING VERSION
+        Shows bright Red / Green / Blue in BOTH Landscape and Portrait modes
+        """
+        # ------------------------------------------------------------------
+        # 1. Normalize to uint8 if needed
+        # ------------------------------------------------------------------
         if display_img.dtype != np.uint8:
-            f = display_img.astype(np.float32)
-            mn, mx = float(np.min(f)), float(np.max(f))
+            img = display_img.astype(np.float32)
+            mn, mx = img.min(), img.max()
             if mx > mn:
-                f = (f - mn) / (mx - mn) * 255.0
-            disp8 = np.clip(f, 0, 255).astype(np.uint8)
+                img = (img - mn) / (mx - mn) * 255.0
+            else:
+                img = np.zeros_like(img)
+            disp8 = np.clip(img, 0, 255).astype(np.uint8)
         else:
             disp8 = display_img
 
+        # ------------------------------------------------------------------
+        # 2. True colour mode? (Red / Green / Blue channel)
+        # ------------------------------------------------------------------
+        true_colour = label in ("Red", "Green", "Blue")
+
+        # ------------------------------------------------------------------
+        # 3. First draw – create the imshow object
+        # ------------------------------------------------------------------
         if self.main_img is None:
             self.ax.clear()
-            if disp8.ndim == 2:
-                self.main_img = self.ax.imshow(disp8, cmap=cmap, interpolation="nearest", animated=True)
-            else:
+            if true_colour and disp8.ndim == 3:
+                # Show real RGB – NO colormap!
                 self.main_img = self.ax.imshow(disp8, interpolation="nearest", animated=True)
+            else:
+                # Grayscale path
+                gray = disp8 if disp8.ndim == 2 else cv2.cvtColor(disp8, cv2.COLOR_RGB2GRAY)
+                self.main_img = self.ax.imshow(gray, cmap="gray", interpolation="nearest", animated=True)
             self.ax.axis("off")
-        else:
-            self.main_img.set_data(disp8)
-            if disp8.ndim == 2:
-                self.main_img.set_cmap(cmap)
 
+        # ------------------------------------------------------------------
+        # 4. Subsequent frames – just update data (fast!)
+        # ------------------------------------------------------------------
+        else:
+            if true_colour and disp8.ndim == 3:
+                # Keep real RGB
+                self.main_img.set_data(disp8)
+                self.main_img.set_cmap(None)        # VERY IMPORTANT
+            else:
+                # Grayscale
+                gray = disp8 if disp8.ndim == 2 else cv2.cvtColor(disp8, cv2.COLOR_RGB2GRAY)
+                self.main_img.set_data(gray)
+                self.main_img.set_cmap("gray")
+
+        # ------------------------------------------------------------------
+        # 5. Title + original colour for magnifier
+        # ------------------------------------------------------------------
         self.ax.set_title(label)
         self.img_shape = disp8.shape[:2]
 
@@ -255,36 +277,10 @@ class MplCanvas(FigureCanvas):
                 self.over_ax.set_visible(False)
             self.overview_img = None
             self.overview_rect = None
-        else:
-            over_img = disp8.copy()
-            h, w = over_img.shape[:2]
-            ratio = (self.fig.bbox.height / 2) / max(1, h)
-            new_w = max(1, int(ratio * w))
-            new_h = max(1, int(ratio * h))
-            over_img_resized = cv2.resize(over_img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-            over_img_resized = ensure_uint8_rgb(over_img_resized)
-            new_width = over_img_resized.shape[1] / max(1.0, self.fig.bbox.width)
 
-            if not hasattr(self, "over_ax") or self.over_ax is None:
-                self.over_ax = self.fig.add_axes([1 - new_width, 0.5, new_width, 0.5])
-                self.over_ax.axis("off")
-            else:
-                self.over_ax.set_position([1 - new_width, 0.5, new_width, 0.5])
-                self.over_ax.set_visible(True)
-
-            if self.overview_img is None:
-                self.over_ax.clear()
-                if over_img_resized.ndim == 3:
-                    self.overview_img = self.over_ax.imshow(over_img_resized, interpolation="nearest")
-                else:
-                    self.overview_img = self.over_ax.imshow(over_img_resized, cmap="gray", interpolation="nearest")
-                self.over_ax.axis("off")
-                self.overview_rect = patches.Rectangle((0, 0), over_img_resized.shape[1], over_img_resized.shape[0],
-                                                       edgecolor="red", facecolor="none", linewidth=1)
-                self.over_ax.add_patch(self.overview_rect)
-            else:
-                self.overview_img.set_data(over_img_resized)
-
+        # ------------------------------------------------------------------
+        # 6. Limits & redraw
+        # ------------------------------------------------------------------
         self.ax.set_xlim(0, self.img_shape[1])
         self.ax.set_ylim(self.img_shape[0], 0)
         self.draw_start = time.time()
@@ -532,36 +528,39 @@ class MainWindow(QMainWindow):
 
     def display_frame(self, _=None):
         index = int(self.scroll_bar.value())
-        t0 = time.time()
-
         if self.preload:
-            container = getattr(self, "frames", None)
-            if container is None: return
-            frame = container[index] if isinstance(container, (list, np.ndarray)) and len(container) > index else container[index]
+            frame = self.frames[index]
         else:
             frame = self.tif.pages[index].asarray(out=self.buffer)
 
-        # APPLY ROTATION
+        # Rotate if Portrait
         if self.rotation_mode == 1:
             frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
 
+        # Normalize to uint8
+        if frame.dtype != np.uint8:
+            fmin, fmax = frame.min(), frame.max()
+            if fmax > fmin:
+                frame = ((frame - fmin) / (fmax - fmin) * 255).astype(np.uint8)
+            else:
+                frame = np.zeros_like(frame, dtype=np.uint8)
+
+        # Resize
         h, w = frame.shape[:2]
-        scale = self.width / max(1, w)
-        target_h = max(1, int(h * scale))
-        frame_resized = cv2.resize(frame, (self.width, target_h), interpolation=cv2.INTER_AREA)
+        frame_resized = cv2.resize(frame, (self.width, int(h * self.width / w)), cv2.INTER_AREA)
 
-        print(f"Frame {index} (+ rotate) time: {(time.time()-t0)*1000:.1f} ms")
-
+        # Get color
         color = self.selected_colors[index] if index < len(self.selected_colors) else "Gray"
 
-        if frame_resized.ndim == 2:
-            display_img = frame_resized.copy()
-            original_color = ensure_uint8_rgb(frame_resized)
-        else:
-            original_color = ensure_uint8_rgb(frame_resized)
-            display_img = cv2.cvtColor(original_color, cv2.COLOR_RGB2GRAY)
+        # Build RGB
+        rgb = np.zeros((*frame_resized.shape, 3), dtype=np.uint8)
+        if color == "Red":   rgb[..., 0] = frame_resized
+        elif color == "Green":  rgb[..., 1] = frame_resized
+        elif color == "Blue":   rgb[..., 2] = frame_resized
+        else:                   rgb = cv2.cvtColor(frame_resized, cv2.COLOR_GRAY2RGB) if frame_resized.ndim == 2 else frame_resized[..., :3]
 
-        self.canvas.show_frame(display_img, color, original_color=original_color)
+        # Display
+        self.canvas.show_frame(rgb, color, original_color=rgb)
 
 
 if __name__ == "__main__":
