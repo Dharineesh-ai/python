@@ -1,4 +1,6 @@
-# full_tiff_viewer_with_autofix.py
+# newtest.py
+# TIFF viewer (Option B) — image width always fits viewport width (no horizontal scroll)
+# Restores correct Red / Green / Blue channel behaviour (handles 2D and 3D frames)
 import sys
 import time
 from datetime import datetime
@@ -111,7 +113,8 @@ class ColorSelector(QDialog):
         layout.addWidget(confirm_button)
 
     def get_selected_colors(self):
-        return [self.list_widget.item(i).text() for i in range(self.list_widget.count())]
+        # Normalize stored color names to Title case for consistency
+        return [self.list_widget.item(i).text().strip() for i in range(self.list_widget.count())]
 
 
 class DraggableOverlay(QLabel):
@@ -203,14 +206,16 @@ class MplCanvas(FigureCanvas):
             w, h = self.get_width_height()
             dpi = self.fig.dpi
             self.fig.set_size_inches(w / dpi, h / dpi)
-        except: pass
+        except:
+            pass
         try:
             pw, ph = self.width(), self.height()
             ow, oh = self.overlay.width(), self.overlay.height()
             x = min(self.overlay.x(), max(0, pw - ow))
             y = min(self.overlay.y(), max(0, ph - oh))
             self.overlay.move(x, y)
-        except: pass
+        except:
+            pass
 
     def show_frame(self, display_img, label="", original_color=None):
         """
@@ -233,8 +238,10 @@ class MplCanvas(FigureCanvas):
 
         # ------------------------------------------------------------------
         # 2. True colour mode? (Red / Green / Blue channel)
+        # Make the check case-insensitive to avoid label mismatches
         # ------------------------------------------------------------------
-        true_colour = label in ("Red", "Green", "Blue")
+        label_norm = (label or "").strip().lower()
+        true_colour = label_norm in ("red", "green", "blue")
 
         # ------------------------------------------------------------------
         # 3. First draw – create the imshow object
@@ -267,7 +274,8 @@ class MplCanvas(FigureCanvas):
         # ------------------------------------------------------------------
         # 5. Title + original colour for magnifier
         # ------------------------------------------------------------------
-        self.ax.set_title(label)
+        # Show title in Title Case for clarity
+        self.ax.set_title(label.title() if label else "")
         self.img_shape = disp8.shape[:2]
 
         if original_color is not None:
@@ -281,8 +289,12 @@ class MplCanvas(FigureCanvas):
         # ------------------------------------------------------------------
         # 6. Limits & redraw
         # ------------------------------------------------------------------
-        self.ax.set_xlim(0, self.img_shape[1])
-        self.ax.set_ylim(self.img_shape[0], 0)
+        try:
+            self.ax.set_xlim(0, self.img_shape[1])
+            self.ax.set_ylim(self.img_shape[0], 0)
+        except:
+            pass
+
         self.draw_start = time.time()
         self.draw_idle()
 
@@ -360,19 +372,8 @@ class MplCanvas(FigureCanvas):
         self.draw_idle()
 
     def update_overview_rect(self, event=None):
-        if not (self.overview_img and self.overview_rect and self.main_img):
-            return
-        try:
-            x0, x1 = self.ax.get_xlim()
-            y0, y1 = self.ax.get_ylim()
-            main_h, main_w = self.main_img.get_array().shape[:2]
-            ov_h, ov_w = self.overview_img.get_array().shape[:2]
-            rx = max(0, x0 / main_w * ov_w)
-            ry = max(0, y1 / main_h * ov_h)
-            rw = (x1 - x0) / main_w * ov_w
-            rh = (y0 - y1) / main_h * ov_h
-            self.overview_rect.set_bounds(rx, ry, max(1, rw), max(1, rh))
-        except: pass
+        # kept for compatibility; overview not used in this simplified pipeline
+        return
 
 
 class TiffLoaderThread(QThread):
@@ -401,7 +402,6 @@ class MainWindow(QMainWindow):
     def __init__(self, tiff_path, width, height, dpi):
         super().__init__()
         self.setWindowTitle("TIFF Frame Viewer — Landscape Mode")
-        self.rotation_mode = 0  # 0 = Landscape, 1 = Portrait (90° clockwise)
 
         # Progress bar
         self.progress_bar = QProgressBar()
@@ -414,7 +414,10 @@ class MainWindow(QMainWindow):
         scroll_area = QScrollArea()
         self.canvas = MplCanvas(width, height, dpi)
         scroll_area.setWidget(self.canvas)
+        # For Option B we want the canvas to be free-size vertically, but we hide horizontal scroll
         scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll_area = scroll_area
 
         self.width = width
         self.height = height
@@ -423,29 +426,8 @@ class MainWindow(QMainWindow):
         # Layout
         layout = QVBoxLayout()
 
-        # Orientation buttons
-        btn_layout = QHBoxLayout()
-        self.landscape_btn = QPushButton("Landscape")
-        self.portrait_btn = QPushButton("Portrait")
-        self.landscape_btn.setCheckable(True)
-        self.portrait_btn.setCheckable(True)
-        self.landscape_btn.setChecked(True)
-
-        self.landscape_btn.setShortcut("L")
-        self.portrait_btn.setShortcut("P")
-
-        self.landscape_btn.clicked.connect(self.set_landscape)
-        self.portrait_btn.clicked.connect(self.set_portrait)
-
-        style = "QPushButton:checked { background-color: #4CAF50; color: white; font-weight: bold; padding: 6px; }"
-        self.landscape_btn.setStyleSheet(style.replace("#4CAF50", "#4CAF50"))
-        self.portrait_btn.setStyleSheet(style.replace("#4CAF50", "#2196F3"))
-
-        btn_layout.addWidget(QLabel("Orientation:"))
-        btn_layout.addWidget(self.landscape_btn)
-        btn_layout.addWidget(self.portrait_btn)
-        btn_layout.addStretch()
-        layout.addLayout(btn_layout)
+        # Orientation buttons removed as requested
+        # (Landscape / Portrait buttons and their callbacks were removed)
 
         layout.addWidget(scroll_area)
 
@@ -463,30 +445,6 @@ class MainWindow(QMainWindow):
 
         self.preload = self.should_preload(tiff_path)
         self.load_tiff(tiff_path)
-
-    def set_landscape(self):
-        if self.rotation_mode == 0: return
-        self.rotation_mode = 0
-        self.landscape_btn.setChecked(True)
-        self.portrait_btn.setChecked(False)
-        self.setWindowTitle("TIFF Frame Viewer — Landscape Mode")
-        print("Orientation → Landscape (0°)")
-        self.display_current_frame()
-
-    def set_portrait(self):
-        if self.rotation_mode == 1: return
-        self.rotation_mode = 1
-        self.landscape_btn.setChecked(False)
-        self.portrait_btn.setChecked(True)
-        self.setWindowTitle("TIFF Frame Viewer — Portrait Mode")
-        print("Orientation → Portrait (90° clockwise)")
-        self.display_current_frame()
-
-    def display_current_frame(self):
-        current = self.scroll_bar.value()
-        self.scroll_bar.blockSignals(True)
-        self.display_frame(current)
-        self.scroll_bar.blockSignals(False)
 
     def should_preload(self, path):
         file_size = os.path.getsize(path)
@@ -512,8 +470,12 @@ class MainWindow(QMainWindow):
             self.buffer = np.empty_like(sample)
             dialog = ColorSelector(self.frames_count, parent=self)
             self.selected_colors = dialog.get_selected_colors() if dialog.exec_() else ["Gray"] * self.frames_count
+            # Normalize selected colors to Title case to be safe
+            self.selected_colors = [c.strip().title() for c in self.selected_colors]
             self.scroll_bar.setMaximum(max(0, self.frames_count - 1))
             self.scroll_bar.setValue(0)
+            # display first frame immediately
+            self.display_frame(0)
 
     def on_tiff_loaded(self, frames, count):
         print("TIFF fully loaded into RAM")
@@ -522,9 +484,24 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(False)
         dialog = ColorSelector(self.frames_count, parent=self)
         self.selected_colors = dialog.get_selected_colors() if dialog.exec_() else ["Gray"] * self.frames_count
+        self.selected_colors = [c.strip().title() for c in self.selected_colors]
         self.scroll_bar.setMaximum(max(0, self.frames_count - 1))
         self.scroll_bar.setValue(0)
         self.display_frame(0)
+
+    def resizeEvent(self, event):
+        """
+        When main window resizes, re-display current frame so image width matches new viewport width.
+        """
+        try:
+            super().resizeEvent(event)
+        except:
+            pass
+        try:
+            # call display_frame directly (previous display_current_frame removed)
+            self.display_frame()
+        except:
+            pass
 
     def display_frame(self, _=None):
         index = int(self.scroll_bar.value())
@@ -533,11 +510,7 @@ class MainWindow(QMainWindow):
         else:
             frame = self.tif.pages[index].asarray(out=self.buffer)
 
-        # Rotate if Portrait
-        if self.rotation_mode == 1:
-            frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-
-        # Normalize to uint8
+        # ---- NORMALIZE TO uint8 ----
         if frame.dtype != np.uint8:
             fmin, fmax = frame.min(), frame.max()
             if fmax > fmin:
@@ -545,26 +518,85 @@ class MainWindow(QMainWindow):
             else:
                 frame = np.zeros_like(frame, dtype=np.uint8)
 
-        # Resize
+        # ---- RESIZE TO FIT VIEWPORT WIDTH (no horizontal scroll) ----
+        try:
+            viewport_w = int(self.scroll_area.viewport().width())
+        except:
+            viewport_w = 0
+
+        if viewport_w <= 1:
+            try:
+                canvas_w = int(self.canvas.get_width_height()[0])
+            except:
+                canvas_w = max(100, self.width)
+            viewport_w = canvas_w
+
         h, w = frame.shape[:2]
-        frame_resized = cv2.resize(frame, (self.width, int(h * self.width / w)), cv2.INTER_AREA)
+        new_w = max(1, int(viewport_w))
+        new_h = max(1, int(h * (new_w / float(w))))
+        frame_resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-        # Get color
+        # ---- COLOUR ASSIGNMENT: robust to 2D (gray) or 3D (color) frames ----
         color = self.selected_colors[index] if index < len(self.selected_colors) else "Gray"
+        color_norm = (color or "").strip().title()  # "Green", "Red", "Blue", "Gray", etc.
 
-        # Build RGB
-        rgb = np.zeros((*frame_resized.shape, 3), dtype=np.uint8)
-        if color == "Red":   rgb[..., 0] = frame_resized
-        elif color == "Green":  rgb[..., 1] = frame_resized
-        elif color == "Blue":   rgb[..., 2] = frame_resized
-        else:                   rgb = cv2.cvtColor(frame_resized, cv2.COLOR_GRAY2RGB) if frame_resized.ndim == 2 else frame_resized[..., :3]
+        # Build rgb output safely
+        if frame_resized.ndim == 2:
+            # grayscale -> create channels from gray
+            if color_norm == "Red":
+                rgb = np.zeros((frame_resized.shape[0], frame_resized.shape[1], 3), dtype=np.uint8)
+                rgb[..., 0] = frame_resized
+            elif color_norm == "Green":
+                rgb = np.zeros((frame_resized.shape[0], frame_resized.shape[1], 3), dtype=np.uint8)
+                rgb[..., 1] = frame_resized
+            elif color_norm == "Blue":
+                rgb = np.zeros((frame_resized.shape[0], frame_resized.shape[1], 3), dtype=np.uint8)
+                rgb[..., 2] = frame_resized
+            else:
+                rgb = cv2.cvtColor(frame_resized, cv2.COLOR_GRAY2RGB)
+        else:
+            # color image (H,W,3 or H,W,>=3). Use appropriate channels
+            if frame_resized.shape[2] >= 3:
+                if color_norm == "Red":
+                    rgb = np.zeros_like(frame_resized[..., :3])
+                    rgb[..., 0] = frame_resized[..., 0]
+                elif color_norm == "Green":
+                    rgb = np.zeros_like(frame_resized[..., :3])
+                    rgb[..., 1] = frame_resized[..., 1]
+                elif color_norm == "Blue":
+                    rgb = np.zeros_like(frame_resized[..., :3])
+                    rgb[..., 2] = frame_resized[..., 2]
+                else:
+                    rgb = frame_resized[..., :3]
+            else:
+                # fallback: convert to RGB
+                rgb = cv2.cvtColor(frame_resized[..., 0], cv2.COLOR_GRAY2RGB) if frame_resized.ndim == 3 else cv2.cvtColor(frame_resized, cv2.COLOR_GRAY2RGB)
 
-        # Display
-        self.canvas.show_frame(rgb, color, original_color=rgb)
+        rgb = ensure_uint8_rgb(rgb)
+
+        # --- Update canvas and ensure the FigureCanvas widget reports the pixel size so scrollbars appear ---
+        # Pass a Label that matches the color (title-case) so show_frame can detect true_colour
+        self.canvas.show_frame(rgb, color_norm, original_color=rgb)
+
+        # Set the canvas minimum size to the image pixel dimensions so scroll area can scroll vertically only
+        h_img, w_img = rgb.shape[:2]
+        # Force canvas width to viewport width (avoid horizontal scroll)
+        try:
+            viewport_w = int(self.scroll_area.viewport().width())
+            if viewport_w > 1:
+                w_img = viewport_w
+        except:
+            pass
+
+        self.canvas.setMinimumSize(w_img, h_img)
+        self.canvas.resize(w_img, h_img)
+
+        # Force a draw to update the widget size / scrollbars
+        self.canvas.draw_idle()
 
 
 if __name__ == "__main__":
-    # Change this path to your TIFF file
+    # Change this path to your TIFF file before running
     tiff_path = r"D:\python-master\2024.08.01_cLift-Kontrolle_A0206-02_Rl50Gh35_1677.tif"
 
     app = QApplication(sys.argv)
