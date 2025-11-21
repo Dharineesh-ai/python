@@ -204,14 +204,15 @@ class MplCanvas(FigureCanvas):
         # We'll create the magnifier later once we have a parent (parent is set after widget added to scroll area)
         self.overlay = None
 
-        # Static preview label (top-right). Will show full original image and current view rect.
+        # Static preview label (floating). Created without parent initially.
         self.preview_w = 240
-        self.preview_h = 180
-        self.preview_label = QLabel(parent=self)
-        self.preview_label.setFixedSize(self.preview_w, self.preview_h)
+        self.preview_label = QLabel(parent=None)
+        # Don't set fixed height here; will match viewport height when parent becomes available
+        self.preview_label.setFixedWidth(self.preview_w)
         self.preview_label.setStyleSheet("QLabel { border: 2px solid white; background: black; }")
         self.preview_label.setVisible(False)
         self.preview_label.setScaledContents(False)
+        # Position later (after parent established) via _position_preview
         self._position_preview()
 
         self.setFocusPolicy(Qt.StrongFocus)
@@ -241,11 +242,30 @@ class MplCanvas(FigureCanvas):
 
     def _position_preview(self):
         try:
-            pw, ph = self.width(), self.height()
-            x = max(10, pw - self.preview_w - 10)
-            y = 10
-            self.preview_label.move(x, y)
-            self.preview_label.raise_()
+            # If canvas has a parent (after being added to scroll area), reparent the preview to that viewport
+            parent_widget = self.parent()  # normally the QScrollArea.viewport()
+            if parent_widget is not None and self.preview_label.parent() is not parent_widget:
+                # reparent the preview label to the viewport so it floats while scrolling
+                self.preview_label.setParent(parent_widget)
+                # set preview height to match viewport height
+                try:
+                    self.preview_label.setFixedHeight(parent_widget.height())
+                except:
+                    pass
+                self.preview_label.setFixedWidth(self.preview_w)
+
+            # If parent exists, position preview at right side, y=0
+            if self.preview_label.parent() is not None:
+                p = self.preview_label.parent()
+                # ensure height matches
+                try:
+                    self.preview_label.setFixedHeight(p.height())
+                except:
+                    pass
+                x = max(5, p.width() - self.preview_w - 5)
+                y = 0
+                self.preview_label.move(x, y)
+                self.preview_label.raise_()
         except:
             pass
 
@@ -265,6 +285,7 @@ class MplCanvas(FigureCanvas):
                     x = min(self.overlay.x(), max(0, parent_widget.width() - ow))
                     y = min(self.overlay.y(), max(0, parent_widget.height() - oh))
                     self.overlay.move(x, y)
+            # reposition preview and ensure preview height matches parent
             self._position_preview()
         except:
             pass
@@ -492,15 +513,25 @@ class MplCanvas(FigureCanvas):
         orig = self.original_img
         h_orig, w_orig = orig.shape[:2]
         qimg = QImage(orig.data.tobytes(), w_orig, h_orig, orig.strides[0], QImage.Format_RGB888)
-        pix = QPixmap.fromImage(qimg).scaled(self.preview_w, self.preview_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
-        out = QPixmap(self.preview_w, self.preview_h)
+        # Ensure preview_label has a valid parent and size
+        parent_widget = self.preview_label.parent()
+        if parent_widget is None:
+            # try to reparent if canvas parent exists
+            if self.parent() is not None:
+                parent_widget = self.parent()
+                self.preview_label.setParent(parent_widget)
+        preview_h = self.preview_label.height() if self.preview_label.height() > 1 else 180
+
+        pix = QPixmap.fromImage(qimg).scaled(self.preview_w, preview_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+        out = QPixmap(self.preview_w, preview_h)
         out.fill(QColor(0, 0, 0))
         painter = QPainter(out)
         painter.setRenderHint(QPainter.Antialiasing, True)
 
         pix_x = (self.preview_w - pix.width()) // 2
-        pix_y = (self.preview_h - pix.height()) // 2
+        pix_y = (preview_h - pix.height()) // 2
         painter.drawPixmap(pix_x, pix_y, pix)
 
         if draw_rect and self.img_shape is not None:
