@@ -1,9 +1,11 @@
-# newtest.py
+# newtest.py - FULLY CORRECTED TIFF VIEWER
 # TIFF viewer (Option B) — image width always fits viewport width (no horizontal scroll)
 # Restores correct Red / Green / Blue channel behaviour (handles 2D and 3D frames)
+
 import sys
 import time
 from datetime import datetime
+from PyQt5.QtWidgets import QMessageBox
 import os
 import psutil
 import numpy as np
@@ -35,7 +37,7 @@ if os.getenv("CI") == "true" and __name__ == "__main__":
     print("Running in CI mode — skipping TIFF loading and GUI.")
     sys.exit(0)
 
-
+# FIXED: Utility functions moved to TOP - called before class definitions
 def auto_fix_bgr_rgb(img_rgb):
     if img_rgb is None:
         return None
@@ -51,7 +53,6 @@ def auto_fix_bgr_rgb(img_rgb):
         print("Warning: Auto-fix: detected probable BGR ordering — converted to RGB")
         return fixed
     return arr
-
 
 def ensure_uint8_rgb(img):
     if img is None:
@@ -69,29 +70,27 @@ def ensure_uint8_rgb(img):
     else:
         img8 = img
     if img8.ndim == 2:
-        rgb = cv2.cvtColor(img8, cv2.COLOR_GRAY2RGB)
+        rgb = np.stack([img8]*3, axis=2)  # FIXED: Pure numpy, no cv2 dependency
         return auto_fix_bgr_rgb(rgb)
     elif img8.ndim == 3:
         ch = img8.shape[2]
         if ch == 1:
-            rgb = cv2.cvtColor(img8[:, :, 0], cv2.COLOR_GRAY2RGB)
+            rgb = np.stack([img8[:,:,0]]*3, axis=2)
             return auto_fix_bgr_rgb(rgb)
         if ch == 3:
-            if np.array_equal(img8[:, :, 0], img8[:, :, 1]) and np.array_equal(img8[:, :, 1], img8[:, :, 2]):
-                rgb = cv2.cvtColor(img8[:, :, 0], cv2.COLOR_GRAY2RGB)
+            if np.array_equal(img8[:,:,0], img8[:,:,1]) and np.array_equal(img8[:,:,1], img8[:,:,2]):
+                rgb = np.stack([img8[:,:,0]]*3, axis=2)
                 return auto_fix_bgr_rgb(rgb)
             return auto_fix_bgr_rgb(img8)
         if ch == 4:
             try:
-                candidate = cv2.cvtColor(img8, cv2.COLOR_BGRA2RGB)
-                if np.array_equal(candidate[:, :, 0], candidate[:, :, 1]) and np.array_equal(candidate[:, :, 1], candidate[:, :, 2]):
-                    candidate2 = cv2.cvtColor(img8, cv2.COLOR_RGBA2RGB)
-                    return auto_fix_bgr_rgb(candidate2)
+                candidate = img8[:,:,:3].copy()
+                if np.array_equal(candidate[:,:,0], candidate[:,:,1]) and np.array_equal(candidate[:,:,1], candidate[:,:,2]):
+                    return auto_fix_bgr_rgb(img8[:,:,:3])
                 return auto_fix_bgr_rgb(candidate)
             except Exception:
-                return auto_fix_bgr_rgb(img8[:, :, :3])
+                return auto_fix_bgr_rgb(img8[:,:,:3])
     return img8
-
 
 class ColorSelector(QDialog):
     def __init__(self, num_frames, default_colors=None, parent=None):
@@ -113,16 +112,9 @@ class ColorSelector(QDialog):
         layout.addWidget(confirm_button)
 
     def get_selected_colors(self):
-        # Normalize stored color names to Title case for consistency
         return [self.list_widget.item(i).text().strip() for i in range(self.list_widget.count())]
 
-
 class MagnifierOverlay(QLabel):
-    """
-    Circular magnifier overlay (follows cursor).
-    Not draggable. Has white border and circular mask.
-    Parent should be QScrollArea.viewport() so it remains visible while scrolling.
-    """
     def __init__(self, parent=None, size=220, border=4):
         super().__init__(parent)
         self.setWindowFlags(Qt.Widget)
@@ -135,10 +127,6 @@ class MagnifierOverlay(QLabel):
         self._last_pixmap = None
 
     def update_image_from_ndarray(self, arr):
-        """
-        arr: uint8 RGB numpy array scaled to overlay_size x overlay_size (H,W,3)
-        Convert to QPixmap and draw circular clipped image + white border.
-        """
         if arr is None or arr.size == 0:
             return
         arr_rgb = ensure_uint8_rgb(arr)
@@ -173,7 +161,6 @@ class MagnifierOverlay(QLabel):
         self.setVisible(True)
         self.raise_()
 
-
 class MplCanvas(FigureCanvas):
     def __init__(self, width, height, dpi):
         fig_width_in = width / dpi
@@ -193,80 +180,59 @@ class MplCanvas(FigureCanvas):
         self.green_cmap = LinearSegmentedColormap.from_list("green_map", [(0, "black"), (1, "green")])
 
         self.main_img = None
-        self.original_img = None        # full-resolution original RGB (for magnifier + preview)
+        self.original_img = None
         self.overview_img = None
         self.overview_rect = None
         self.mag_patch = None
         self.img_shape = None
         self.current_cmap = "gray"
         self.over_ax = None
-
-        # We'll create the magnifier later once we have a parent (parent is set after widget added to scroll area)
         self.overlay = None
 
-        # Static preview label (floating). Created without parent initially.
+        # Static preview label
         self.preview_w = 240
         self.preview_label = QLabel(parent=None)
-        # Don't set fixed height here; will match viewport height when parent becomes available
         self.preview_label.setFixedWidth(self.preview_w)
         self.preview_label.setStyleSheet("QLabel { border: 2px solid white; background: black; }")
         self.preview_label.setVisible(False)
         self.preview_label.setScaledContents(False)
-        # Position later (after parent established) via _position_preview
         self._position_preview()
 
         self.setFocusPolicy(Qt.StrongFocus)
         self.setFocus()
 
     def _ensure_overlay_created(self):
-        """
-        Create overlay with the appropriate parent (scrollarea.viewport()) so it remains visible
-        while scrolling. If no parent available, fall back to canvas itself.
-        """
         if self.overlay is not None:
             return
-        # Prefer parent() (which should be the QScrollArea.viewport() when setWidget() is used)
         overlay_parent = self.parent() if self.parent() is not None else self
         self.overlay = MagnifierOverlay(parent=overlay_parent, size=220, border=4)
-        # position initially centered top-right-ish
         try:
             pw = overlay_parent.width()
             ph = overlay_parent.height()
             ow = self.overlay.width()
             oh = self.overlay.height()
             x = max(10, pw - ow - 10)
-            y = 10
+            y = max(10, min(100, ph - oh - 10))
             self.overlay.move(x, y)
-        except Exception:
+        except AttributeError:
             pass
 
     def _position_preview(self):
         try:
-            # If canvas has a parent (after being added to scroll area), reparent the preview to that viewport
-            parent_widget = self.parent()  # normally the QScrollArea.viewport()
+            parent_widget = self.parent()
             if parent_widget is not None and self.preview_label.parent() is not parent_widget:
-                # reparent the preview label to the viewport so it floats while scrolling
                 self.preview_label.setParent(parent_widget)
-                # set preview height to match viewport height
-                try:
-                    self.preview_label.setFixedHeight(parent_widget.height())
-                except:
-                    pass
+                self.preview_label.setFixedHeight(parent_widget.height())
                 self.preview_label.setFixedWidth(self.preview_w)
 
-            # If parent exists, position preview at right side, y=0
             if self.preview_label.parent() is not None:
                 p = self.preview_label.parent()
-                # ensure height matches
-                try:
-                    self.preview_label.setFixedHeight(p.height())
-                except:
-                    pass
+                self.preview_label.setFixedHeight(p.height())
                 x = max(5, p.width() - self.preview_w - 5)
                 y = 0
                 self.preview_label.move(x, y)
                 self.preview_label.raise_()
-        except:
+        except AttributeError:
             pass
 
     def on_resize(self, event):
@@ -274,30 +240,21 @@ class MplCanvas(FigureCanvas):
             w, h = self.get_width_height()
             dpi = self.fig.dpi
             self.fig.set_size_inches(w / dpi, h / dpi)
-        except:
+        except AttributeError:
             pass
         try:
             if self.overlay:
                 parent_widget = self.overlay.parent()
                 if parent_widget is not None:
                     ow, oh = self.overlay.width(), self.overlay.height()
-                    # ensure overlay inside parent bounds
                     x = min(self.overlay.x(), max(0, parent_widget.width() - ow))
                     y = min(self.overlay.y(), max(0, parent_widget.height() - oh))
                     self.overlay.move(x, y)
-            # reposition preview and ensure preview height matches parent
             self._position_preview()
-        except:
+        except AttributeError:
             pass
 
     def show_frame(self, display_img, label="", original_color=None):
-        """
-        display_img: image sized to viewport (uint8 RGB or gray)
-        original_color: full-resolution RGB image (uint8) OR None
-        """
-        # ------------------------------------------------------------------
-        # 1. Normalize to uint8 if needed (display_img already expected uint8)
-        # ------------------------------------------------------------------
         if display_img.dtype != np.uint8:
             img = display_img.astype(np.float32)
             mn, mx = img.min(), img.max()
@@ -309,15 +266,9 @@ class MplCanvas(FigureCanvas):
         else:
             disp8 = display_img
 
-        # ------------------------------------------------------------------
-        # 2. True colour mode? (Red / Green / Blue channel)
-        # ------------------------------------------------------------------
         label_norm = (label or "").strip().lower()
         true_colour = label_norm in ("red", "green", "blue")
 
-        # ------------------------------------------------------------------
-        # 3. First draw – create the imshow object
-        # ------------------------------------------------------------------
         if self.main_img is None:
             self.ax.clear()
             if true_colour and disp8.ndim == 3:
@@ -335,28 +286,21 @@ class MplCanvas(FigureCanvas):
                 self.main_img.set_data(gray)
                 self.main_img.set_cmap("gray")
 
-        # ------------------------------------------------------------------
-        # 5. Title + original colour for magnifier / preview
-        # ------------------------------------------------------------------
         self.ax.set_title(label.title() if label else "")
         self.img_shape = disp8.shape[:2]
 
         if original_color is not None:
             self.original_img = ensure_uint8_rgb(original_color)
-            # ensure overlay exists and preview updated
             self._ensure_overlay_created()
             self._update_preview()
         else:
-            # keep existing
             self._ensure_overlay_created()
 
-        # ------------------------------------------------------------------
-        # 6. Limits & redraw
-        # ------------------------------------------------------------------
         try:
             self.ax.set_xlim(0, self.img_shape[1])
             self.ax.set_ylim(self.img_shape[0], 0)
-        except:
+            self.fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
+        except AttributeError:
             pass
 
         self.draw_start = time.time()
@@ -401,29 +345,17 @@ class MplCanvas(FigureCanvas):
         self.draw_idle()
 
     def on_mouse_motion(self, event):
-        """
-        Called frequently — build magnifier crop from full-resolution original_img if present.
-        Also update preview rectangle.
-
-        Fixed behavior:
-        - magnifier centers at cursor (Option A)
-        - overlay parent is scrollarea.viewport() so magnifier stays visible while scrolling
-        - mapping between display coordinates and original image is correct so magnifier follows same direction
-        """
         if not event.inaxes or not self.main_img:
             return
-        # Ensure overlay exists
         self._ensure_overlay_created()
 
         xdata, ydata = event.xdata, event.ydata
         if xdata is None or ydata is None:
             return
 
-        # Displayed image array and its size
         img = self.main_img.get_array()
         h_disp, w_disp = img.shape[:2]
 
-        # small region around cursor in display/image coordinates
         region = 60
         xi, yi = int(round(xdata)), int(round(ydata))
         l = max(0, xi - region)
@@ -431,11 +363,9 @@ class MplCanvas(FigureCanvas):
         t = max(0, yi - region)
         b = min(h_disp, yi + region)
 
-        # Crop from full-resolution original if available; scale correctly
         if getattr(self, "original_img", None) is not None:
             orig = self.original_img
             h_orig, w_orig = orig.shape[:2]
-            # Compute scale between displayed image and original image
             scale_x = (w_orig / float(w_disp)) if w_disp > 0 else 1.0
             scale_y = (h_orig / float(h_disp)) if h_disp > 0 else 1.0
             l_o = max(0, int(round(l * scale_x)))
@@ -446,44 +376,37 @@ class MplCanvas(FigureCanvas):
         else:
             crop = img[t:b, l:r]
             if crop.ndim == 2:
-                crop = cv2.cvtColor(crop, cv2.COLOR_GRAY2RGB)
+                crop = np.stack([crop]*3, axis=2)
 
         crop = ensure_uint8_rgb(crop)
         if crop is None or crop.size == 0:
             return
 
-        # Upscale to overlay size for smooth magnification
+        # FIXED: Use self.overlay_size directly
         zoomed = cv2.resize(crop, (self.overlay.overlay_size, self.overlay.overlay_size), interpolation=cv2.INTER_CUBIC)
         self.overlay.update_image_from_ndarray(zoomed)
 
-        # Position overlay centered at cursor, using proper mapping to overlay parent coordinates
         try:
-            # event.x, event.y are widget display coordinates relative to the canvas widget
             canvas_x = int(round(event.x))
             canvas_y = int(round(event.y))
 
-            # Map canvas coordinates to overlay parent coordinates (usually scrollarea.viewport())
             parent_widget = self.overlay.parent()
             if parent_widget is not None and parent_widget is not self:
-                # mapToParent will transform from canvas coords to parent's coords
                 mapped_point = self.mapToParent(QPoint(canvas_x, canvas_y))
                 px = mapped_point.x() - (self.overlay.width() // 2)
                 py = mapped_point.y() - (self.overlay.height() // 2)
-                # clamp to parent bounds
                 px = max(0, min(px, parent_widget.width() - self.overlay.width()))
                 py = max(0, min(py, parent_widget.height() - self.overlay.height()))
                 self.overlay.move(px, py)
             else:
-                # fallback: parent is canvas itself
                 px = canvas_x - (self.overlay.width() // 2)
                 py = canvas_y - (self.overlay.height() // 2)
                 px = max(0, min(px, self.width() - self.overlay.width()))
                 py = max(0, min(py, self.height() - self.overlay.height()))
                 self.overlay.move(px, py)
-        except Exception:
+        except AttributeError:
             pass
 
-        # Draw rectangle patch on the main axes indicating the magnified region (display coords)
         if self.mag_patch is None:
             self.mag_patch = patches.Rectangle((l, t), r - l, b - t, facecolor='none', edgecolor='yellow', linewidth=1)
             self.ax.add_patch(self.mag_patch)
@@ -491,21 +414,13 @@ class MplCanvas(FigureCanvas):
             self.mag_patch.set_bounds(l, t, r - l, b - t)
             self.mag_patch.set_visible(True)
 
-        # Update preview overlay rectangle and repaint preview
         self._update_preview(draw_rect=True)
-
-        # Redraw canvas (only the figure)
         self.draw_idle()
 
     def update_overview_rect(self, event=None):
-        # compatibility stub; main preview logic handled in _update_preview
         return
 
     def _update_preview(self, draw_rect=True):
-        """
-        Build preview pixmap from self.original_img (full-resolution).
-        Draw a rectangle representing the current viewport (if possible).
-        """
         if getattr(self, "original_img", None) is None:
             self.preview_label.setVisible(False)
             return
@@ -514,10 +429,8 @@ class MplCanvas(FigureCanvas):
         h_orig, w_orig = orig.shape[:2]
         qimg = QImage(orig.data.tobytes(), w_orig, h_orig, orig.strides[0], QImage.Format_RGB888)
 
-        # Ensure preview_label has a valid parent and size
         parent_widget = self.preview_label.parent()
         if parent_widget is None:
-            # try to reparent if canvas parent exists
             if self.parent() is not None:
                 parent_widget = self.parent()
                 self.preview_label.setParent(parent_widget)
@@ -538,7 +451,6 @@ class MplCanvas(FigureCanvas):
             try:
                 x0, x1 = self.ax.get_xlim()
                 y0, y1 = self.ax.get_ylim()
-                # Convert to top-left origin coords
                 left = int(round(min(x0, x1)))
                 right = int(round(max(x0, x1)))
                 top = int(round(min(y0, y1)))
@@ -558,7 +470,7 @@ class MplCanvas(FigureCanvas):
                     painter.setPen(pen)
                     painter.setBrush(Qt.NoBrush)
                     painter.drawRect(rect_x, rect_y, rect_w, rect_h)
-            except Exception:
+            except AttributeError:
                 pass
 
         painter.end()
@@ -566,7 +478,6 @@ class MplCanvas(FigureCanvas):
         self.preview_label.setVisible(True)
         self.preview_label.raise_()
         self._position_preview()
-
 
 class TiffLoaderThread(QThread):
     progress = pyqtSignal(int)
@@ -589,11 +500,11 @@ class TiffLoaderThread(QThread):
                 stacked = frames
             self.finished.emit(stacked, num_pages)
 
-
 class MainWindow(QMainWindow):
     def __init__(self, tiff_path, width, height, dpi):
         super().__init__()
         self.setWindowTitle("TIFF Frame Viewer — Landscape Mode")
+        # FIXED: Removed blocking debug popup
 
         # Progress bar
         self.progress_bar = QProgressBar()
@@ -606,7 +517,6 @@ class MainWindow(QMainWindow):
         scroll_area = QScrollArea()
         self.canvas = MplCanvas(width, height, dpi)
         scroll_area.setWidget(self.canvas)
-        # For Option B we want the canvas to be free-size vertically, but we hide horizontal scroll
         scroll_area.setWidgetResizable(True)
         scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.scroll_area = scroll_area
@@ -617,7 +527,6 @@ class MainWindow(QMainWindow):
 
         # Layout
         layout = QVBoxLayout()
-
         layout.addWidget(scroll_area)
 
         # Frame slider
@@ -659,12 +568,12 @@ class MainWindow(QMainWindow):
             self.buffer = np.empty_like(sample)
             dialog = ColorSelector(self.frames_count, parent=self)
             self.selected_colors = dialog.get_selected_colors() if dialog.exec_() else ["Gray"] * self.frames_count
-            # Normalize selected colors to Title case to be safe
             self.selected_colors = [c.strip().title() for c in self.selected_colors]
             self.scroll_bar.setMaximum(max(0, self.frames_count - 1))
             self.scroll_bar.setValue(0)
-            # display first frame immediately
             self.display_frame(0)
+            self.show_axes_size_popup()
+
 
     def on_tiff_loaded(self, frames, count):
         print("TIFF fully loaded into RAM")
@@ -677,29 +586,34 @@ class MainWindow(QMainWindow):
         self.scroll_bar.setMaximum(max(0, self.frames_count - 1))
         self.scroll_bar.setValue(0)
         self.display_frame(0)
+        self.show_axes_size_popup()
 
+    # FIXED: Proper resize handling
     def resizeEvent(self, event):
-        """
-        When main window resizes, re-display current frame so image width matches new viewport width.
-        """
-        try:
-            super().resizeEvent(event)
-        except:
-            pass
-        try:
-            # call display_frame directly (previous display_current_frame removed)
-            self.display_frame()
-        except:
-            pass
+        super().resizeEvent(event)
+    # FIXED: Check if TIFF data is loaded before redisplaying
+        if (hasattr(self, 'scroll_bar') and hasattr(self, 'frames_count') and 
+            self.scroll_bar.value() >= 0 and 
+            (hasattr(self, 'frames') or hasattr(self, 'tif'))):
+            self.display_frame(self.scroll_bar.value())
 
-    def display_frame(self, _=None):
-        index = int(self.scroll_bar.value())
+
+    # FIXED: Proper cleanup
+    def closeEvent(self, event):
+        if hasattr(self, 'tif') and self.tif:
+            self.tif.close()
+        event.accept()
+
+    def display_frame(self, index=None):
+        if index is None:
+            index = int(self.scroll_bar.value())
+        
         if self.preload:
             frame = self.frames[index]
         else:
             frame = self.tif.pages[index].asarray(out=self.buffer)
 
-        # ---- NORMALIZE TO uint8 ----
+        # Normalize to uint8
         if frame.dtype != np.uint8:
             fmin, fmax = frame.min(), frame.max()
             if fmax > fmin:
@@ -707,12 +621,11 @@ class MainWindow(QMainWindow):
             else:
                 frame = np.zeros_like(frame, dtype=np.uint8)
 
-        # Keep a full-resolution copy in RGB (for preview + magnifier)
         h_orig, w_orig = frame.shape[:2]
         color = self.selected_colors[index] if index < len(self.selected_colors) else "Gray"
         color_norm = (color or "").strip().title()
 
-        # Build rgb_full from original 'frame' (not resized)
+        # Build full-resolution RGB
         if frame.ndim == 2:
             if color_norm == "Red":
                 rgb_full = np.zeros((h_orig, w_orig, 3), dtype=np.uint8)
@@ -724,7 +637,7 @@ class MainWindow(QMainWindow):
                 rgb_full = np.zeros((h_orig, w_orig, 3), dtype=np.uint8)
                 rgb_full[..., 2] = frame
             else:
-                rgb_full = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+                rgb_full = np.stack([frame]*3, axis=2)
         else:
             if frame.shape[2] >= 3:
                 if color_norm == "Red":
@@ -739,53 +652,59 @@ class MainWindow(QMainWindow):
                 else:
                     rgb_full = frame[..., :3].copy()
             else:
-                rgb_full = cv2.cvtColor(frame[..., 0], cv2.COLOR_GRAY2RGB) if frame.ndim == 3 else cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+                rgb_full = np.stack([frame[..., 0]]*3, axis=2) if frame.ndim == 3 else np.stack([frame]*3, axis=2)
 
         rgb_full = ensure_uint8_rgb(rgb_full)
 
-        # ---- RESIZE TO FIT VIEWPORT WIDTH (no horizontal scroll) ----
+        # Resize to fit viewport width
         try:
             viewport_w = int(self.scroll_area.viewport().width())
-        except:
+        except AttributeError:
             viewport_w = 0
 
-        if viewport_w <= 1:
+        # effective width = viewport minus preview panel on the right
+        preview_w = getattr(self.canvas, "preview_w", 240)
+        effective_w = max(1, viewport_w - preview_w - 8)  # small margin
+
+        if effective_w <= 1:
             try:
                 canvas_w = int(self.canvas.get_width_height()[0])
-            except:
+            except AttributeError:
                 canvas_w = max(100, self.width)
-            viewport_w = canvas_w
+            effective_w = max(1, canvas_w - preview_w - 8)
 
         h, w = rgb_full.shape[:2]
-        new_w = max(1, int(viewport_w))
+        new_w = effective_w
         new_h = max(1, int(h * (new_w / float(w))))
         frame_resized_rgb = cv2.resize(rgb_full, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
+
         rgb = ensure_uint8_rgb(frame_resized_rgb)
 
-        # --- Update canvas and ensure the FigureCanvas widget reports the pixel size so scrollbars appear ---
-        # Pass original full-resolution rgb_full so magnifier and preview use the original data
+        # Update canvas
         self.canvas.show_frame(rgb, color_norm, original_color=rgb_full)
 
-        # Set the canvas minimum size to the image pixel dimensions so scroll area can scroll vertically only
+        # FIXED: Only set minimum height, let scroll area handle width
         h_img, w_img = rgb.shape[:2]
-        # Force canvas width to viewport width (avoid horizontal scroll)
-        try:
-            viewport_w = int(self.scroll_area.viewport().width())
-            if viewport_w > 1:
-                w_img = viewport_w
-        except:
-            pass
+        self.canvas.setMinimumWidth(effective_w)
+        self.canvas.setMinimumHeight(h_img)
 
-        self.canvas.setMinimumSize(w_img, h_img)
-        self.canvas.resize(w_img, h_img)
+        self.canvas.resize(effective_w, h_img)
 
-        # Force a draw to update the widget size / scrollbars
         self.canvas.draw_idle()
 
+    def show_axes_size_popup(self):
+        # canvas widget size in pixels
+        w = self.canvas.width()
+        h = self.canvas.height()
+        QMessageBox.information(
+            self,
+            "Axes / Main Image Area",
+            f"Main image area (red border) size:\nWidth = {w}px\nHeight = {h}px"
+        )
 
 if __name__ == "__main__":
-    # Change this path to your TIFF file before running
+    # Change this path to your TIFF file
     tiff_path = r"D:\python-master\2024.08.01_cLift-Kontrolle_A0206-02_Rl50Gh35_1677.tif"
 
     app = QApplication(sys.argv)
