@@ -418,7 +418,8 @@ class MplCanvas(FigureCanvas):
         self.draw_idle()
 
     def update_overview_rect(self, event=None):
-        return
+        self._update_preview(draw_rect=True)
+        self.draw_idle()
 
     def _update_preview(self, draw_rect=True):
         if getattr(self, "original_img", None) is None:
