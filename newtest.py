@@ -198,8 +198,14 @@ class MplCanvas(FigureCanvas):
         self.preview_label.setScaledContents(False)
         self._position_preview()
 
+        self.preview_img_w = 0
+        self.preview_img_h = 0
+
         self.setFocusPolicy(Qt.StrongFocus)
         self.setFocus()
+
+        self.last_view_rect = None   # (left, top, right, bottom) in main-image pixels
+
 
     def _ensure_overlay_created(self):
         if self.overlay is not None:
@@ -329,6 +335,7 @@ class MplCanvas(FigureCanvas):
         self.ax.set_xlim(cx - w/2, cx + w/2)
         self.ax.set_ylim(cy + h/2, cy - h/2)
         self.update_overview_rect()
+        self._update_preview(draw_rect=True)
         self.draw_idle()
 
     def zoom_out(self, factor=1.4):
@@ -342,6 +349,7 @@ class MplCanvas(FigureCanvas):
         self.ax.set_xlim(max(0, cx - w/2), min(self.img_shape[1], cx + w/2))
         self.ax.set_ylim(min(self.img_shape[0], cy + h/2), max(0, cy - h/2))
         self.update_overview_rect()
+        self._update_preview(draw_rect=True)
         self.draw_idle()
 
     def on_mouse_motion(self, event):
@@ -363,15 +371,21 @@ class MplCanvas(FigureCanvas):
         t = max(0, yi - region)
         b = min(h_disp, yi + region)
 
+
         if getattr(self, "original_img", None) is not None:
             orig = self.original_img
             h_orig, w_orig = orig.shape[:2]
+
             scale_x = (w_orig / float(w_disp)) if w_disp > 0 else 1.0
             scale_y = (h_orig / float(h_disp)) if h_disp > 0 else 1.0
+
             l_o = max(0, int(round(l * scale_x)))
             r_o = min(w_orig, int(round(r * scale_x)))
             t_o = max(0, int(round(t * scale_y)))
             b_o = min(h_orig, int(round(b * scale_y)))
+
+            self.last_view_rect = (l_o, t_o, r_o, b_o)
+
             crop = orig[t_o:b_o, l_o:r_o]
         else:
             crop = img[t:b, l:r]
@@ -438,6 +452,9 @@ class MplCanvas(FigureCanvas):
 
         pix = QPixmap.fromImage(qimg).scaled(self.preview_w, preview_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
 
+        self.preview_img_w = pix.width()
+        self.preview_img_h = pix.height()
+
         out = QPixmap(self.preview_w, preview_h)
         out.fill(QColor(0, 0, 0))
         painter = QPainter(out)
@@ -449,22 +466,30 @@ class MplCanvas(FigureCanvas):
 
         if draw_rect and self.img_shape is not None:
             try:
-                x0, x1 = self.ax.get_xlim()
-                y0, y1 = self.ax.get_ylim()
-                left = int(round(min(x0, x1)))
-                right = int(round(max(x0, x1)))
-                top = int(round(min(y0, y1)))
-                bottom = int(round(max(y0, y1)))
+                if self.last_view_rect is not None:
+                    left, top, right, bottom = self.last_view_rect
+                else:
+                    x0, x1 = self.ax.get_xlim()
+                    y0, y1 = self.ax.get_ylim()
+                    left = int(round(min(x0, x1)))
+                    right = int(round(max(x0, x1)))
+                    top = int(round(min(y0, y1)))
+                    bottom = int(round(max(y0, y1)))
+
                 view_w = right - left
                 view_h = bottom - top
 
                 if view_w > 0 and view_h > 0:
                     scale_x = pix.width() / float(w_orig)
                     scale_y = pix.height() / float(h_orig)
-                    rect_x = pix_x + int(round(left * scale_x))
-                    rect_y = pix_y + int(round(top * scale_y))
+
+
                     rect_w = max(1, int(round(view_w * scale_x)))
                     rect_h = max(1, int(round(view_h * scale_y)))
+                    
+                    rect_x = pix_x + int(round(left * scale_x))
+                    rect_y = pix_y + int(round(top * scale_y))
+                    
                     pen = QPen(QColor(255, 255, 0))
                     pen.setWidth(2)
                     painter.setPen(pen)
@@ -694,14 +719,26 @@ class MainWindow(QMainWindow):
         self.canvas.draw_idle()
 
     def show_axes_size_popup(self):
-        # canvas widget size in pixels
-        w = self.canvas.width()
-        h = self.canvas.height()
+            # Main image area = canvas widget (what you see inside red border)
+        main_w = self.canvas.width()
+        main_h = self.canvas.height()
+
+            # Preview panel image size (actual scaled preview)
+        prev_w = getattr(self.canvas, "preview_img_w", 0)
+        prev_h = getattr(self.canvas, "preview_img_h", 0)
+
         QMessageBox.information(
             self,
-            "Axes / Main Image Area",
-            f"Main image area (red border) size:\nWidth = {w}px\nHeight = {h}px"
+            "Image Dimensions",
+            f"MAIN IMAGE AREA (red border):\n"
+            f"Width = {main_w}px\n"
+            f"Height = {main_h}px\n\n"
+            f"PREVIEW IMAGE (inside red bar on right):\n"
+            f"Width = {prev_w}px\n"
+            f"Height = {prev_h}px"
         )
+
+
 
 if __name__ == "__main__":
     # Change this path to your TIFF file
