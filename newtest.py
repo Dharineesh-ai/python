@@ -115,7 +115,7 @@ class ColorSelector(QDialog):
         return [self.list_widget.item(i).text().strip() for i in range(self.list_widget.count())]
 
 class MagnifierOverlay(QLabel):
-    def __init__(self, parent=None, size=220, border=4):
+    def __init__(self, parent=None, size=260, border=4):
         super().__init__(parent)
         self.setWindowFlags(Qt.Widget)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
@@ -364,7 +364,7 @@ class MplCanvas(FigureCanvas):
         img = self.main_img.get_array()
         h_disp, w_disp = img.shape[:2]
 
-        region = 60
+        region = 20
         xi, yi = int(round(xdata)), int(round(ydata))
         l = max(0, xi - region)
         r = min(w_disp, xi + region)
@@ -537,6 +537,8 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(False)
         self.progress_bar.setFixedHeight(20)
+        self._first_draw_done = False
+        self._data_ready = False
 
         # Canvas
         scroll_area = QScrollArea()
@@ -568,7 +570,17 @@ class MainWindow(QMainWindow):
 
         self.preload = self.should_preload(tiff_path)
         self.load_tiff(tiff_path)
+    
+    def showEvent(self, event):
+        super().showEvent(event)
+        if (not self._first_draw_done
+            and getattr(self, "_data_ready", False)
+            and hasattr(self, "scroll_bar")):
+            self._first_draw_done = True
+            self.display_frame(self.scroll_bar.value())
+            self.show_axes_size_popup()
 
+    
     def should_preload(self, path):
         file_size = os.path.getsize(path)
         available_ram = psutil.virtual_memory().available
@@ -589,6 +601,7 @@ class MainWindow(QMainWindow):
         else:
             self.tif = tifffile.TiffFile(path)
             self.frames_count = len(self.tif.pages)
+            self._data_ready = True
             sample = self.tif.pages[0].asarray()
             self.buffer = np.empty_like(sample)
             dialog = ColorSelector(self.frames_count, parent=self)
@@ -596,22 +609,30 @@ class MainWindow(QMainWindow):
             self.selected_colors = [c.strip().title() for c in self.selected_colors]
             self.scroll_bar.setMaximum(max(0, self.frames_count - 1))
             self.scroll_bar.setValue(0)
-            self.display_frame(0)
-            self.show_axes_size_popup()
+            #self.display_frame(0)
+            #self.show_axes_size_popup()
 
 
     def on_tiff_loaded(self, frames, count):
         print("TIFF fully loaded into RAM")
         self.frames = frames
         self.frames_count = count
+        self._data_ready = True
         self.progress_bar.setVisible(False)
+
         dialog = ColorSelector(self.frames_count, parent=self)
         self.selected_colors = dialog.get_selected_colors() if dialog.exec_() else ["Gray"] * self.frames_count
         self.selected_colors = [c.strip().title() for c in self.selected_colors]
         self.scroll_bar.setMaximum(max(0, self.frames_count - 1))
         self.scroll_bar.setValue(0)
-        self.display_frame(0)
-        self.show_axes_size_popup()
+
+        # Fallback: if window already visible when loading finishes,
+        # trigger the first draw here.
+        if self.isVisible() and not self._first_draw_done:
+            self._first_draw_done = True
+            self.display_frame(self.scroll_bar.value())
+            self.show_axes_size_popup()
+
 
     # FIXED: Proper resize handling
     def resizeEvent(self, event):
@@ -630,6 +651,19 @@ class MainWindow(QMainWindow):
         event.accept()
 
     def display_frame(self, index=None):
+        # Resize to fit viewport width
+        try:
+            viewport_w = int(self.scroll_area.viewport().width())
+        except AttributeError:
+            viewport_w = self.width
+
+        # effective width = viewport minus preview panel on the right
+        preview_w = getattr(self.canvas, "preview_w", 240)
+        effective_w = max(1, viewport_w - preview_w - 8)  # small margin
+
+        if effective_w <= 200:
+            effective_w = max(1, self.width - preview_w - 8)
+
         if index is None:
             index = int(self.scroll_bar.value())
         
@@ -681,22 +715,7 @@ class MainWindow(QMainWindow):
 
         rgb_full = ensure_uint8_rgb(rgb_full)
 
-        # Resize to fit viewport width
-        try:
-            viewport_w = int(self.scroll_area.viewport().width())
-        except AttributeError:
-            viewport_w = 0
-
-        # effective width = viewport minus preview panel on the right
-        preview_w = getattr(self.canvas, "preview_w", 240)
-        effective_w = max(1, viewport_w - preview_w - 8)  # small margin
-
-        if effective_w <= 1:
-            try:
-                canvas_w = int(self.canvas.get_width_height()[0])
-            except AttributeError:
-                canvas_w = max(100, self.width)
-            effective_w = max(1, canvas_w - preview_w - 8)
+        
 
         h, w = rgb_full.shape[:2]
         new_w = effective_w
@@ -712,7 +731,7 @@ class MainWindow(QMainWindow):
         # FIXED: Only set minimum height, let scroll area handle width
         h_img, w_img = rgb.shape[:2]
         self.canvas.setMinimumWidth(effective_w)
-        self.canvas.setMinimumHeight(h_img)
+        self.canvas.setMaximumWidth(effective_w)
 
         self.canvas.resize(effective_w, h_img)
 
