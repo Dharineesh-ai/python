@@ -1,11 +1,14 @@
-# newtest.py - FULLY CORRECTED TIFF VIEWER
+# newtest.py - FULLY CORRECTED TIFF VIEWER WITH PERCENTILE B&C + MENU
 # TIFF viewer (Option B) — image width always fits viewport width (no horizontal scroll)
 # Restores correct Red / Green / Blue channel behaviour (handles 2D and 3D frames)
 
 import sys
 import time
 from datetime import datetime
-from PyQt5.QtWidgets import QMessageBox
+from PyQt5.QtWidgets import (QMessageBox, QMenuBar, QMenu, QAction, QVBoxLayout, 
+                            QHBoxLayout, QWidget, QLabel, QScrollBar, QApplication,
+                            QMainWindow, QScrollArea, QListWidgetItem, QPushButton, 
+                            QListWidget, QDialog, QProgressBar, QSizePolicy)
 import os
 import psutil
 import numpy as np
@@ -24,11 +27,6 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from matplotlib.colors import LinearSegmentedColormap
 import matplotlib.patches as patches
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QScrollArea, QVBoxLayout, QWidget, QScrollBar,
-    QListWidgetItem, QPushButton, QLabel, QListWidget, QDialog, QProgressBar,
-    QSizePolicy, QHBoxLayout
-)
 from PyQt5.QtCore import Qt, QPoint, QThread, pyqtSignal, QSize, QRect
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QPainterPath, QPen, QColor, QBrush
 
@@ -91,6 +89,17 @@ def ensure_uint8_rgb(img):
             except Exception:
                 return auto_fix_bgr_rgb(img8[:,:,:3])
     return img8
+
+# NEW: Percentile-based vmin/vmax computation (3rd/97th percentile)
+def compute_percentile_range(img, vmin_pct=3.0, vmax_pct=97.0):
+    """Compute robust min/max using percentiles to ignore outliers"""
+    if img is None or img.size == 0:
+        return 0.0, 255.0
+    
+    flat = img.flatten()
+    vmin = np.percentile(flat, vmin_pct)
+    vmax = np.percentile(flat, vmax_pct)
+    return vmin, vmax
 
 class ColorSelector(QDialog):
     def __init__(self, num_frames, default_colors=None, parent=None):
@@ -205,7 +214,6 @@ class MplCanvas(FigureCanvas):
         self.setFocus()
 
         self.last_view_rect = None   # (left, top, right, bottom) in main-image pixels
-
 
     def _ensure_overlay_created(self):
         if self.overlay is not None:
@@ -371,7 +379,6 @@ class MplCanvas(FigureCanvas):
         t = max(0, yi - region)
         b = min(h_disp, yi + region)
 
-
         if getattr(self, "original_img", None) is not None:
             orig = self.original_img
             h_orig, w_orig = orig.shape[:2]
@@ -396,9 +403,13 @@ class MplCanvas(FigureCanvas):
         if crop is None or crop.size == 0:
             return
 
-        # FIXED: Use self.overlay_size directly
-        zoomed = cv2.resize(crop, (self.overlay.overlay_size, self.overlay.overlay_size), interpolation=cv2.INTER_CUBIC)
+        # *** SUPER ZOOMED MAGNIFIER (2x more zoom) ***
+        target_size = self.overlay.overlay_size * 2  # 2x zoom factor
+        zoomed = cv2.resize(crop, (target_size, target_size), interpolation=cv2.INTER_CUBIC)
         self.overlay.update_image_from_ndarray(zoomed)
+
+    # ... rest of the method unchanged ...
+
 
         try:
             canvas_x = int(round(event.x))
@@ -483,7 +494,6 @@ class MplCanvas(FigureCanvas):
                     scale_x = pix.width() / float(w_orig)
                     scale_y = pix.height() / float(h_orig)
 
-
                     rect_w = max(1, int(round(view_w * scale_x)))
                     rect_h = max(1, int(round(view_h * scale_y)))
                     
@@ -528,8 +538,15 @@ class TiffLoaderThread(QThread):
 class MainWindow(QMainWindow):
     def __init__(self, tiff_path, width, height, dpi):
         super().__init__()
-        self.setWindowTitle("TIFF Frame Viewer — Landscape Mode")
+        self.setWindowTitle("TIFF Frame Viewer — Landscape Mode + Percentile B&C")
         # FIXED: Removed blocking debug popup
+
+        # NEW: Brightness/Contrast state with percentile enhancement
+        self.brightness = 0.0
+        self.contrast = 0.0
+        self.percentile_vmin = 3.0  # 3rd percentile
+        self.percentile_vmax = 97.0  # 97th percentile
+        self.use_percentile = True   # Toggle for percentile enhancement
 
         # Progress bar
         self.progress_bar = QProgressBar()
@@ -552,9 +569,37 @@ class MainWindow(QMainWindow):
         self.height = height
         self.dpi = dpi
 
+        # NEW: Create Menu Bar with Adjust dropdown (smartphone-style)
+        self._create_menu_bar()
+
         # Layout
         layout = QVBoxLayout()
         layout.addWidget(scroll_area)
+        
+        # Keep existing sliders HIDDEN by default (controlled by menu)
+        bc_layout = QHBoxLayout()
+        self.brightness_slider = QScrollBar(Qt.Horizontal)
+        self.brightness_slider.setMinimum(-100)
+        self.brightness_slider.setMaximum(100)
+        self.brightness_slider.setValue(0)
+        self.brightness_slider.setFixedHeight(16)
+        self.brightness_slider.valueChanged.connect(self.set_brightness)
+        bc_layout.addWidget(QLabel("B:"))
+        bc_layout.addWidget(self.brightness_slider)
+
+        self.contrast_slider = QScrollBar(Qt.Horizontal)
+        self.contrast_slider.setMinimum(-100)
+        self.contrast_slider.setMaximum(100)
+        self.contrast_slider.setValue(0)
+        self.contrast_slider.setFixedHeight(16)
+        self.contrast_slider.valueChanged.connect(self.set_contrast)
+        bc_layout.addWidget(QLabel("C:"))
+        bc_layout.addWidget(self.contrast_slider)
+
+        self.bc_container = QWidget()
+        self.bc_container.setLayout(bc_layout)
+        self.bc_container.setVisible(False)  # HIDDEN by default
+        layout.addWidget(self.bc_container)
 
         # Frame slider
         self.scroll_bar = QScrollBar(Qt.Horizontal)
@@ -571,6 +616,68 @@ class MainWindow(QMainWindow):
         self.preload = self.should_preload(tiff_path)
         self.load_tiff(tiff_path)
     
+    # NEW: Menu bar with smartphone-style Adjust dropdown
+    def _create_menu_bar(self):
+        menubar = self.menuBar()
+        
+        # Adjust Menu (like smartphone volume)
+        adjust_menu = menubar.addMenu("Adjust")
+        
+        # Toggle sliders visibility
+        toggle_sliders_action = QAction("Show B&C Sliders", self)
+        toggle_sliders_action.setShortcut("Ctrl+B")
+        toggle_sliders_action.setCheckable(True)
+        toggle_sliders_action.toggled.connect(self.toggle_bc_sliders)
+        adjust_menu.addAction(toggle_sliders_action)
+        
+        # Percentile settings
+        percentile_menu = adjust_menu.addMenu("Percentile Range")
+        self.vmin_action = QAction(f"Vmin: {self.percentile_vmin}%", self)
+        self.vmin_action.setCheckable(False)
+        self.vmin_action.triggered.connect(lambda: self.change_percentile('vmin'))
+        percentile_menu.addAction(self.vmin_action)
+        
+        self.vmax_action = QAction(f"Vmax: {self.percentile_vmax}%", self)
+        self.vmax_action.setCheckable(False)
+        self.vmax_action.triggered.connect(lambda: self.change_percentile('vmax'))
+        percentile_menu.addAction(self.vmax_action)
+        
+        # Reset
+        reset_action = QAction("Reset B&C", self)
+        reset_action.setShortcut("Ctrl+R")
+        reset_action.triggered.connect(self.reset_bc)
+        adjust_menu.addAction(reset_action)
+    
+    def toggle_bc_sliders(self, checked):
+        self.bc_container.setVisible(checked)
+    
+    def change_percentile(self, which):
+        if which == 'vmin':
+            new_val = 3.0 if self.percentile_vmin == 1.0 else 1.0 if self.percentile_vmin == 5.0 else 5.0
+            self.percentile_vmin = new_val
+            self.vmin_action.setText(f"Vmin: {new_val}%")
+        else:
+            new_val = 97.0 if self.percentile_vmax == 99.0 else 99.0 if self.percentile_vmax == 95.0 else 95.0
+            self.percentile_vmax = new_val
+            self.vmax_action.setText(f"Vmax: {new_val}%")
+        print(f"Percentile range updated: vmin={self.percentile_vmin}%, vmax={self.percentile_vmax}%")
+        self.display_frame(self.scroll_bar.value())
+
+    def reset_bc(self):
+        self.brightness = 0.0
+        self.contrast = 0.0
+        self.brightness_slider.setValue(0)
+        self.contrast_slider.setValue(0)
+        self.display_frame(self.scroll_bar.value())
+
+    def set_brightness(self, value):
+        self.brightness = float(value)
+        self.display_frame(self.scroll_bar.value())
+
+    def set_contrast(self, value):
+        self.contrast = float(value)
+        self.display_frame(self.scroll_bar.value())
+
     def showEvent(self, event):
         super().showEvent(event)
         if (not self._first_draw_done
@@ -579,7 +686,6 @@ class MainWindow(QMainWindow):
             self._first_draw_done = True
             self.display_frame(self.scroll_bar.value())
             self.show_axes_size_popup()
-
     
     def should_preload(self, path):
         file_size = os.path.getsize(path)
@@ -609,9 +715,6 @@ class MainWindow(QMainWindow):
             self.selected_colors = [c.strip().title() for c in self.selected_colors]
             self.scroll_bar.setMaximum(max(0, self.frames_count - 1))
             self.scroll_bar.setValue(0)
-            #self.display_frame(0)
-            #self.show_axes_size_popup()
-
 
     def on_tiff_loaded(self, frames, count):
         print("TIFF fully loaded into RAM")
@@ -633,16 +736,13 @@ class MainWindow(QMainWindow):
             self.display_frame(self.scroll_bar.value())
             self.show_axes_size_popup()
 
-
     # FIXED: Proper resize handling
     def resizeEvent(self, event):
         super().resizeEvent(event)
-    # FIXED: Check if TIFF data is loaded before redisplaying
         if (hasattr(self, 'scroll_bar') and hasattr(self, 'frames_count') and 
             self.scroll_bar.value() >= 0 and 
             (hasattr(self, 'frames') or hasattr(self, 'tif'))):
             self.display_frame(self.scroll_bar.value())
-
 
     # FIXED: Proper cleanup
     def closeEvent(self, event):
@@ -672,56 +772,76 @@ class MainWindow(QMainWindow):
         else:
             frame = self.tif.pages[index].asarray(out=self.buffer)
 
-        # Normalize to uint8
+        # NEW: Percentile-based normalization (3%/97% by default) BEFORE B&C
+        h_orig, w_orig = frame.shape[:2]
+        
         if frame.dtype != np.uint8:
-            fmin, fmax = frame.min(), frame.max()
-            if fmax > fmin:
-                frame = ((frame - fmin) / (fmax - fmin) * 255).astype(np.uint8)
+            # Compute robust percentile range
+            pmin, pmax = compute_percentile_range(frame, self.percentile_vmin, self.percentile_vmax)
+            if pmax > pmin:
+                frame = ((frame.astype(np.float32) - pmin) / (pmax - pmin) * 255).astype(np.uint8)
             else:
                 frame = np.zeros_like(frame, dtype=np.uint8)
+        else:
+            # For uint8, still apply percentile clipping for better contrast
+            pmin, pmax = compute_percentile_range(frame, self.percentile_vmin, self.percentile_vmax)
+            f = frame.astype(np.float32)
+            frame = np.clip(((f - pmin) / (pmax - pmin) * 255), 0, 255).astype(np.uint8)
 
-        h_orig, w_orig = frame.shape[:2]
         color = self.selected_colors[index] if index < len(self.selected_colors) else "Gray"
         color_norm = (color or "").strip().title()
 
-        # Build full-resolution RGB
-        if frame.ndim == 2:
+        # ----- IMPROVED Brightness / contrast adjustment -----
+        # frame is now percentile-normalized uint8
+        f = frame.astype(np.float32)
+
+        # Map slider contrast [-100,100] -> factor [0.1, 3.0]
+        c = self.contrast / 100.0
+        alpha = 0.1 + 2.9 * (c + 1.0) / 2.0  # [0.1, 3.0]
+
+        # Map brightness [-100,100] -> additive offset [-128, 128]
+        beta = self.brightness * 1.28
+
+        f = f * alpha + beta
+        f = np.clip(f, 0, 255)
+        frame_adjusted = f.astype(np.uint8)
+        # --------------------------------------------
+
+        # Build full-resolution RGB using adjusted frame
+        if frame_adjusted.ndim == 2:
             if color_norm == "Red":
                 rgb_full = np.zeros((h_orig, w_orig, 3), dtype=np.uint8)
-                rgb_full[..., 0] = frame
+                rgb_full[..., 0] = frame_adjusted
             elif color_norm == "Green":
                 rgb_full = np.zeros((h_orig, w_orig, 3), dtype=np.uint8)
-                rgb_full[..., 1] = frame
+                rgb_full[..., 1] = frame_adjusted
             elif color_norm == "Blue":
                 rgb_full = np.zeros((h_orig, w_orig, 3), dtype=np.uint8)
-                rgb_full[..., 2] = frame
+                rgb_full[..., 2] = frame_adjusted
             else:
-                rgb_full = np.stack([frame]*3, axis=2)
+                rgb_full = np.stack([frame_adjusted]*3, axis=2)
         else:
-            if frame.shape[2] >= 3:
+            if frame_adjusted.shape[2] >= 3:
                 if color_norm == "Red":
-                    rgb_full = np.zeros_like(frame[..., :3])
-                    rgb_full[..., 0] = frame[..., 0]
+                    rgb_full = np.zeros_like(frame_adjusted[..., :3])
+                    rgb_full[..., 0] = frame_adjusted[..., 0]
                 elif color_norm == "Green":
-                    rgb_full = np.zeros_like(frame[..., :3])
-                    rgb_full[..., 1] = frame[..., 1]
+                    rgb_full = np.zeros_like(frame_adjusted[..., :3])
+                    rgb_full[..., 1] = frame_adjusted[..., 1]
                 elif color_norm == "Blue":
-                    rgb_full = np.zeros_like(frame[..., :3])
-                    rgb_full[..., 2] = frame[..., 2]
+                    rgb_full = np.zeros_like(frame_adjusted[..., :3])
+                    rgb_full[..., 2] = frame_adjusted[..., 2]
                 else:
-                    rgb_full = frame[..., :3].copy()
+                    rgb_full = frame_adjusted[..., :3].copy()
             else:
-                rgb_full = np.stack([frame[..., 0]]*3, axis=2) if frame.ndim == 3 else np.stack([frame]*3, axis=2)
+                rgb_full = np.stack([frame_adjusted[..., 0]]*3, axis=2) if frame_adjusted.ndim == 3 else np.stack([frame_adjusted]*3, axis=2)
 
         rgb_full = ensure_uint8_rgb(rgb_full)
-
-        
 
         h, w = rgb_full.shape[:2]
         new_w = effective_w
         new_h = max(1, int(h * (new_w / float(w))))
         frame_resized_rgb = cv2.resize(rgb_full, (new_w, new_h), interpolation=cv2.INTER_AREA)
-
 
         rgb = ensure_uint8_rgb(frame_resized_rgb)
 
@@ -738,11 +858,11 @@ class MainWindow(QMainWindow):
         self.canvas.draw_idle()
 
     def show_axes_size_popup(self):
-            # Main image area = canvas widget (what you see inside red border)
+        # Main image area = canvas widget (what you see inside red border)
         main_w = self.canvas.width()
         main_h = self.canvas.height()
 
-            # Preview panel image size (actual scaled preview)
+        # Preview panel image size (actual scaled preview)
         prev_w = getattr(self.canvas, "preview_img_w", 0)
         prev_h = getattr(self.canvas, "preview_img_h", 0)
 
@@ -754,10 +874,9 @@ class MainWindow(QMainWindow):
             f"Height = {main_h}px\n\n"
             f"PREVIEW IMAGE (inside red bar on right):\n"
             f"Width = {prev_w}px\n"
-            f"Height = {prev_h}px"
+            f"Height = {prev_h}px\n\n"
+            f"Percentile Range: {self.percentile_vmin}% - {self.percentile_vmax}%"
         )
-
-
 
 if __name__ == "__main__":
     # Change this path to your TIFF file
